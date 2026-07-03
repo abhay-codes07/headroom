@@ -1743,7 +1743,12 @@ class OpenAIHandlerMixin:
             try:
                 compressor = _get_image_compressor()
                 if compressor and compressor.has_images(messages):
-                    messages = compressor.compress(messages, provider="openai")
+                    # Offload CPU-bound image compression onto the bounded
+                    # executor (same as text compression); inline blocked the loop.
+                    messages = await self._run_compression_in_executor(
+                        lambda: compressor.compress(messages, provider="openai"),
+                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                    )
                     if compressor.last_result:
                         logger.info(
                             f"[{request_id}] Image: {compressor.last_result.technique.value} "
@@ -1751,6 +1756,10 @@ class OpenAIHandlerMixin:
                             f"{compressor.last_result.original_tokens} → "
                             f"{compressor.last_result.compressed_tokens} tokens)"
                         )
+            except Exception as e:
+                # Image compression is best-effort — fail open on timeout/error and
+                # forward the original messages, matching the text path.
+                logger.warning(f"[{request_id}] Image compression failed: {type(e).__name__}: {e}")
             finally:
                 if compressor and hasattr(compressor, "close"):
                     compressor.close()
@@ -3071,6 +3080,14 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        # Mirror the WS handler: never forward Codex's client-only lite header
+        # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
+        # POST path (unlike the WS path) otherwise forwards request headers verbatim.
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+        }
         log_outbound_headers(
             forwarder="openai_responses",
             stripped_count=_pre_strip_count_resp,
