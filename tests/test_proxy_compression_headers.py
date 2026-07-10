@@ -236,9 +236,7 @@ class TestRequestContentEncodingStripping:
 
     def test_transfer_encoding_is_stripped(self):
         """transfer-encoding: chunked also describes the wire body, not the payload."""
-        headers = self._strip(
-            {"transfer-encoding": "chunked", "content-type": "application/json"}
-        )
+        headers = self._strip({"transfer-encoding": "chunked", "content-type": "application/json"})
         assert "transfer-encoding" not in headers
 
     def test_strip_is_safe_when_content_encoding_absent(self):
