@@ -81,6 +81,28 @@ class TestCCRToolCallDetection:
 
         assert handler.has_ccr_tool_calls(response, "openai")
 
+    def test_openai_empty_choices_does_not_crash(self):
+        """A present-but-empty `choices: []` (Azure content-filter blocks, the
+        trailing usage-only chunk) must not IndexError — it just has no CCR calls."""
+        handler = CCRResponseHandler()
+
+        response = {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 0}}
+
+        # Before the fix this raised IndexError from choices[0].
+        assert handler.has_ccr_tool_calls(response, "openai") is False
+        assert handler._extract_tool_calls(response, "openai") == []
+        assert handler._extract_assistant_message(response, "openai") == {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": None,
+        }
+
+    def test_openai_missing_choices_does_not_crash(self):
+        """A response with no `choices` key at all is also handled."""
+        handler = CCRResponseHandler()
+
+        assert handler.has_ccr_tool_calls({}, "openai") is False
+
     def test_no_ccr_tool_call_anthropic(self):
         """No false positive when no CCR tool call present."""
         handler = CCRResponseHandler()

@@ -132,8 +132,11 @@ class CCRResponseHandler:
             return []
 
         elif provider == "openai":
-            # OpenAI format: message.tool_calls array
-            message = response.get("choices", [{}])[0].get("message", {})
+            # OpenAI format: message.tool_calls array. Use `or [{}]` rather than a
+            # default arg: a present-but-empty `choices: []` (Azure content-filter
+            # blocks, or the trailing usage-only chunk) would otherwise IndexError.
+            choices = response.get("choices") or [{}]
+            message = choices[0].get("message", {})
             tool_calls = message.get("tool_calls", [])
             return list(tool_calls) if tool_calls else []
 
@@ -405,7 +408,9 @@ class CCRResponseHandler:
                 "content": response.get("content", []),
             }
         elif provider == "openai":
-            message = response.get("choices", [{}])[0].get("message", {})
+            # `or [{}]` guards against a present-but-empty `choices: []`.
+            choices = response.get("choices") or [{}]
+            message = choices[0].get("message", {})
             return {
                 "role": "assistant",
                 "content": message.get("content"),
