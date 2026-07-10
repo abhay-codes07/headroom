@@ -171,10 +171,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
                 # before (keeps existing filenames stable — no migration churn).
                 existing_id = existing_fm.get("headroom_id", "")
                 if headroom_id and existing_id and existing_id != headroom_id:
-                    suffix = (
-                        content_hash
-                        or hashlib.sha256(content.encode()).hexdigest()[:16]
-                    )[:8]
+                    suffix = (content_hash or hashlib.sha256(content.encode()).hexdigest()[:16])[:8]
                     filename = f"headroom_{slug}_{suffix}.md"
                     target = self._memory_dir / filename
                     if target.exists():
