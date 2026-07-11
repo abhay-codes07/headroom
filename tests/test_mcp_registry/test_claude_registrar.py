@@ -477,11 +477,10 @@ def test_register_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: st
 def test_register_via_file_preserves_malformed_config(tmp_path: Path, contents: str) -> None:
     """Registering must NOT clobber an existing but unparseable config.
 
-    ~/.claude/.claude.json holds unrelated Claude state (projects, oauthAccount,
+    ~/.claude.json holds unrelated Claude state (projects, oauthAccount,
     session history). Before the fix a malformed file was read as {} and then
     overwritten with only {"mcpServers": ...}, destroying everything else."""
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(contents, encoding="utf-8")
     reg = _make_registrar(tmp_path, cli=None)
 
@@ -496,8 +495,7 @@ def test_register_via_file_preserves_malformed_config(tmp_path: Path, contents: 
 def test_register_via_file_merges_into_existing_valid_config(tmp_path: Path) -> None:
     """The happy path still merges: unrelated keys are preserved and mcpServers
     gains the headroom entry."""
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps({"projects": {"/x": {"y": 1}}, "oauthAccount": {"id": "abc"}}),
         encoding="utf-8",
