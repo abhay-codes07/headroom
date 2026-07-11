@@ -471,6 +471,8 @@ def test_register_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: st
     assert result.status == RegisterStatus.REGISTERED
     data = json.loads(cfg.read_text())
     assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+
+
 @pytest.mark.parametrize("contents", ["not json", "{", '{"projects": }', "[]"])
 def test_register_via_file_preserves_malformed_config(tmp_path: Path, contents: str) -> None:
     """Registering must NOT clobber an existing but unparseable config.
