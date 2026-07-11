@@ -330,17 +330,22 @@ def test_register_then_re_register_with_different_env_returns_mismatch(tmp_path:
 
 
 def test_register_server_on_malformed_config_file(tmp_path: Path) -> None:
-    """register_server overwrites a malformed config file, preserving nothing."""
+    """register_server refuses to overwrite a malformed config, preserving it.
+
+    Updated for the clobber guard: opencode.json holds theme/model/provider and
+    other MCP servers, so a present-but-unparseable file is left untouched and
+    registration fails rather than silently wiping the user's config.
+    """
     registrar = _registrar(tmp_path)
     (tmp_path / "opencode.json").write_text("not valid json at all")
     from headroom.mcp_registry.base import ServerSpec
 
     spec = ServerSpec(name="headroom", command="headroom", args=("mcp", "serve"))
     result = registrar.register_server(spec)
-    assert result.status == RegisterStatus.REGISTERED
+    assert result.status == RegisterStatus.FAILED
 
-    data = json.loads((tmp_path / "opencode.json").read_text())
-    assert "headroom" in data["mcp"]
+    # The malformed file is left byte-for-byte untouched rather than clobbered.
+    assert (tmp_path / "opencode.json").read_text() == "not valid json at all"
 
 
 def test_entry_to_spec_command_as_string() -> None:
