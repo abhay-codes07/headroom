@@ -122,11 +122,13 @@ def test_prefix_cache_stats_prices_by_most_used_model(
 
     def _savings(tokens_by_model: dict[str, int]) -> float:
         metrics = PrometheusMetrics()
+        # Use a large read count so the reported savings_usd (rounded to 4 dp)
+        # stays exact and the price ratio is not lost to rounding.
         metrics.cache_by_provider["anthropic"].update(
             {
                 "requests": 1,
                 "hit_requests": 1,
-                "cache_read_tokens": 1000,
+                "cache_read_tokens": 1_000_000,
                 "cache_write_tokens": 0,
                 "cache_write_5m_tokens": 0,
                 "cache_write_1h_tokens": 0,
