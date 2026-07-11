@@ -266,9 +266,15 @@ def test_unwrap_opencode_removes_rtk_from_agents_md(
         result = runner.invoke(main, ["unwrap", "opencode"])
 
     assert result.exit_code == 0, result.output
-    # Both rtk blocks are gone after unwrap (previously left behind).
-    assert wrap_mod._RTK_MARKER not in global_agents.read_text(encoding="utf-8")
-    assert wrap_mod._RTK_MARKER not in project_agents.read_text(encoding="utf-8")
+
+    # Both rtk blocks are gone after unwrap (previously left behind). A file that
+    # held only the rtk block is removed entirely by _remove_rtk_instructions, so
+    # treat a missing file as "block gone".
+    def _rtk_absent(path: Path) -> bool:
+        return not path.exists() or wrap_mod._RTK_MARKER not in path.read_text(encoding="utf-8")
+
+    assert _rtk_absent(global_agents)
+    assert _rtk_absent(project_agents)
 
 
 def test_wrap_opencode_idempotent_no_duplicate_block(
