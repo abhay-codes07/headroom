@@ -149,6 +149,8 @@ def test_build_manifest_persists_no_http2_override() -> None:
 
     assert manifest.proxy_args.count("--no-http2") == 1
     assert "HEADROOM_HTTP2" not in manifest.base_env
+
+
 def test_resolve_targets_provider_scope_all_ignores_unsupported_requested() -> None:
     """`all` mode never consults the requested list, so an unsupported entry
     like `cursor` must not make it raise — it should return the full provider
