@@ -970,6 +970,7 @@ async def test_handle_google_batch_create_preserves_functioncall_response_order(
                     messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
                 )
             )
+            self.captured_body: dict | None = None
 
         async def _next_request_id(self) -> str:
             return "req-1"
@@ -985,6 +986,11 @@ async def test_handle_google_batch_create_preserves_functioncall_response_order(
 
         async def _store_google_batch_context(self, *a, **k) -> None:  # noqa: ANN002, ANN003
             pass
+
+        async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+            # Capture the (in-place mutated) forwarded batch body for assertions.
+            self.captured_body = body
+            return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
 
     handler = RealConvHandler()
 
@@ -1011,19 +1017,12 @@ async def test_handle_google_batch_create_preserves_functioncall_response_order(
     async def payload(request):  # noqa: ANN001, ANN201
         return batch_body
 
-    captured: dict[str, object] = {}
-
-    async def retry(method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
-        captured["body"] = body
-        return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
-
     monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
-    monkeypatch.setattr(handler, "_retry_request", retry)
 
     resp = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
     assert resp.status_code == 200
 
-    out = captured["body"]["batch"]["input_config"]["requests"]["requests"][0]["request"][
+    out = handler.captured_body["batch"]["input_config"]["requests"]["requests"][0]["request"][
         "contents"
     ]
     # All four entries survive in order. The old loop produced only two, dropping
