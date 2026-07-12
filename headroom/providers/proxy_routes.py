@@ -700,12 +700,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "google":
             return await proxy.handle_gemini_generate_content(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:google",
             )
         return await vertex_publisher_passthrough(request, publisher, "generateContent")
@@ -721,12 +721,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "google":
             return await proxy.handle_gemini_generate_content(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:google",
             )
         return await vertex_publisher_passthrough(request, publisher, "streamGenerateContent")
@@ -742,12 +742,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if publisher == "google":
             return await proxy.handle_gemini_count_tokens(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 "vertex:google",
             )
         return await vertex_publisher_passthrough(request, publisher, "countTokens")
