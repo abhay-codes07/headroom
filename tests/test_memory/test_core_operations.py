@@ -491,6 +491,34 @@ class TestSupersede:
         found_ids = [r.memory.id for r in results]
         assert new.id in found_ids
 
+    @pytest.mark.asyncio
+    @network_timeout_handler
+    async def test_superseded_memory_does_not_resurface_in_search(self, memory_system):
+        """The superseded (old) version must not keep coming back from search.
+
+        The vector/text index cached the old entry's metadata with
+        valid_until=None; default search filters superseded rows off that cached
+        copy, so before the fix a search that matched the old content returned
+        the stale version alongside the new one.
+        """
+        old = await memory_system.add(
+            content="User prefers Python",
+            user_id="alice",
+        )
+        new = await memory_system.supersede(
+            old.id,
+            "User now prefers JavaScript frameworks",
+        )
+
+        # A search matching the OLD content must not resurface the old entry.
+        results = await memory_system.search("Python", user_id="alice")
+        found_ids = [r.memory.id for r in results]
+        assert old.id not in found_ids
+
+        # The new version is still searchable.
+        new_results = await memory_system.search("JavaScript", user_id="alice")
+        assert new.id in [r.memory.id for r in new_results]
+
 
 # =============================================================================
 # History Tests
