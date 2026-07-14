@@ -29,12 +29,13 @@ _MEMORY_STORE_GROUP = "headroom.memory_store"
 _MEMORY_VECTOR_GROUP = "headroom.memory_vector"
 _MEMORY_TEXT_GROUP = "headroom.memory_text"
 
-# Process-wide embedder cache keyed by (backend, model). Embedders are
-# stateless with respect to the memory store, so a single instance can
-# safely serve every per-project ``LocalBackend`` created by the
-# BackendRouter. Without this cache, opening N project DBs would load
-# the sentence-transformers / ONNX model N times.
-_EMBEDDER_CACHE: dict[tuple[str, str], Embedder] = {}
+# Process-wide embedder cache keyed by (backend, model, ollama_base_url).
+# Embedders are stateless with respect to the memory store, so a single
+# instance can safely serve every per-project ``LocalBackend`` created by the
+# BackendRouter. Without this cache, opening N project DBs would load the
+# sentence-transformers / ONNX model N times. The Ollama server URL is part of
+# the key so two backends pointing at different servers don't share an embedder.
+_EMBEDDER_CACHE: dict[tuple[str, str, str], Embedder] = {}
 _EMBEDDER_CACHE_LOCK = threading.Lock()
 
 
