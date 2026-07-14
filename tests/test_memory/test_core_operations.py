@@ -20,7 +20,9 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import functools
+import gc
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -70,7 +72,15 @@ def temp_db_path():
         path = Path(f.name)
     yield path
     # Cleanup
-    path.unlink(missing_ok=True)
+    gc.collect()
+    for attempt in range(5):
+        try:
+            path.unlink(missing_ok=True)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1)
     for suffix in ["-shm", "-wal", ".hnsw"]:
         Path(str(path) + suffix).unlink(missing_ok=True)
 
