@@ -548,9 +548,7 @@ class TestSupersede:
             "User now prefers JavaScript frameworks",
         )
 
-        incl = await memory_system.search(
-            "Python", user_id="alice", include_superseded=True
-        )
+        incl = await memory_system.search("Python", user_id="alice", include_superseded=True)
         assert old.id not in [r.memory.id for r in incl]
 
         # Retained in the store for history/audit even though it left the index.
