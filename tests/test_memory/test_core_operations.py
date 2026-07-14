@@ -529,6 +529,34 @@ class TestSupersede:
         new_results = await memory_system.search("JavaScript", user_id="alice")
         assert new.id in [r.memory.id for r in new_results]
 
+    @pytest.mark.asyncio
+    @network_timeout_handler
+    async def test_superseded_index_removal_boundary(self, memory_system):
+        """Boundary of the supersede index-removal (#2143).
+
+        supersede now drops the old id from the vector/text index (not just
+        flips valid_until on the cached copy), so a search matching the old
+        content will not surface it even with include_superseded=True — the
+        entry is gone from the search index, not merely filtered. The store
+        still keeps the row, so get_history stays the source of truth for the
+        superseded version. This pins that contract so a future change that
+        relies on include_superseded search hitting the index fails loudly.
+        """
+        old = await memory_system.add(content="User prefers Python", user_id="alice")
+        new = await memory_system.supersede(
+            old.id,
+            "User now prefers JavaScript frameworks",
+        )
+
+        incl = await memory_system.search(
+            "Python", user_id="alice", include_superseded=True
+        )
+        assert old.id not in [r.memory.id for r in incl]
+
+        # Retained in the store for history/audit even though it left the index.
+        history = await memory_system.get_history(new.id)
+        assert old.id in [m.id for m in history]
+
 
 # =============================================================================
 # History Tests
