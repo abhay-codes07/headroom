@@ -155,6 +155,30 @@ class TestJsonSessionParsing:
         assert tc.output == "port: 8080\nhost: localhost"
         assert not tc.is_error
 
+    def test_token_counts_not_double_counted(self, tmp_path):
+        # promptTokenCount is the full input (cachedContentTokenCount is a subset
+        # of it) and totalTokenCount == prompt + candidates, so the input must be
+        # promptTokenCount and the output candidatesTokenCount, each once.
+        gemini_dir, _ = _setup_gemini_dir(tmp_path)
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        messages = [
+            {
+                "role": "model",
+                "parts": [{"text": "ok"}],
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "cachedContentTokenCount": 300,
+                    "candidatesTokenCount": 500,
+                    "totalTokenCount": 1500,
+                },
+            },
+        ]
+
+        session = scanner._parse_messages("s1", messages)
+
+        assert session.total_input_tokens == 1000
+        assert session.total_output_tokens == 500
+
     def test_multiple_tool_calls(self, tmp_path):
         gemini_dir, chats_dir = _setup_gemini_dir(tmp_path)
         session = _make_gemini_session(

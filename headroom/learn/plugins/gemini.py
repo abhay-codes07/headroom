@@ -216,14 +216,15 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
             usage = msg.get("usageMetadata", msg.get("usage", {}))
             if isinstance(usage, dict):
+                # Gemini's promptTokenCount is the FULL input token count and
+                # cachedContentTokenCount is the cached SUBSET of it, so adding
+                # both double-counts the cached input. Likewise totalTokenCount
+                # == promptTokenCount + candidatesTokenCount, so
+                # (totalTokenCount - promptTokenCount) is just candidatesTokenCount
+                # again — adding it on top double-counts the output. Count the
+                # prompt as input and the candidates as output, once each.
                 total_input_tokens += usage.get("promptTokenCount", 0)
-                total_input_tokens += usage.get("cachedContentTokenCount", 0)
                 total_output_tokens += usage.get("candidatesTokenCount", 0)
-                total_output_tokens += (
-                    usage.get("totalTokenCount", 0) - usage.get("promptTokenCount", 0)
-                    if usage.get("totalTokenCount")
-                    else 0
-                )
 
             if not isinstance(parts, list):
                 continue
