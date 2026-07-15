@@ -423,7 +423,7 @@ class TestHashSecurityValidation:
 
         hash_key = parse_tool_call(tool_call, "anthropic")
         # Note: validation accepts uppercase since we use .lower() for hex check
-        assert hash_key == "ABC123DEF456ABC123DEF456"
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSmartCrusherCcrMarkers:
