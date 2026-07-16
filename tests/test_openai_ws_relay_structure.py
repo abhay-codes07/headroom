@@ -17,9 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-_OPENAI = (
-    Path(__file__).resolve().parents[1] / "headroom" / "proxy" / "handlers" / "openai.py"
-)
+_OPENAI = Path(__file__).resolve().parents[1] / "headroom" / "proxy" / "handlers" / "openai.py"
 
 
 def _indent(line: str) -> int:
@@ -30,9 +28,7 @@ def test_ws_relay_phase1_flush_scoped_to_response_completed():
     lines = _OPENAI.read_text(encoding="utf-8").splitlines()
 
     p1 = next(i for i, ln in enumerate(lines) if "Phase 1: Buffer until first output item" in ln)
-    p2a = next(
-        i for i, ln in enumerate(lines) if i > p1 and "Phase 2a: Suppress mode" in ln
-    )
+    p2a = next(i for i, ln in enumerate(lines) if i > p1 and "Phase 2a: Suppress mode" in ln)
     region = lines[p1:p2a]
 
     if_not_decided = next(ln for ln in region if ln.strip() == "if not decided:")
