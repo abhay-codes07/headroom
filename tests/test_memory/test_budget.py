@@ -157,6 +157,18 @@ class TestStalenessDetection:
         # stale) on every platform, including the Linux CI runner.
         assert manager._is_stale(entry, set()) is True
 
+    def test_namespaced_label_ref_is_not_treated_as_path(self, tmp_path: Path):
+        """An arbitrary `A:B`-style entity label is not a filesystem path, so it
+        must not be staleness-checked (and pruned) just for the colon."""
+        config = BudgetConfig(staleness_check_git=False)
+        manager = MemoryBudgetManager(project_path=tmp_path, config=config)
+        entry = _make_entry(
+            "relationship between two entities",
+            entity_refs=["A:B", "X:foo", "service:api"],
+        )
+
+        assert manager._is_stale(entry, set()) is False
+
     def test_fresh_file_kept(self, tmp_path: Path):
         """Test that memories referencing existing files are kept."""
         # Create the referenced file

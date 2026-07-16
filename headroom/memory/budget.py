@@ -181,11 +181,16 @@ class MemoryBudgetManager:
 
     @staticmethod
     def _looks_like_path(ref: str) -> bool:
-        # POSIX absolute (/x), relative (./x), or a Windows drive-letter path
-        # (C:\x). Without the drive-letter case a Windows absolute ref was never
-        # staleness-checked, so memories pointing at deleted files were never
-        # pruned on Windows. Mirrors the path detection in memory/traffic_learner.
-        return ref.startswith("/") or ref.startswith("./") or (len(ref) > 2 and ref[1] == ":")
+        # POSIX absolute (/x), relative (./x), or a Windows *absolute* drive path
+        # (C:\x or C:/x). Without the drive-letter case a Windows absolute ref
+        # was never staleness-checked, so memories pointing at deleted files were
+        # never pruned on Windows. The drive check is deliberately strict — an
+        # alphabetic drive letter, a colon, then a slash/backslash — so an
+        # arbitrary namespaced entity label like "A:B" is NOT mistaken for a
+        # filesystem path (which would prune a memory just for referencing it).
+        if ref.startswith("/") or ref.startswith("./"):
+            return True
+        return len(ref) >= 3 and ref[0].isalpha() and ref[1] == ":" and ref[2] in ("\\", "/")
 
     def _is_stale(self, memory: MemoryEntry, git_files: set[str]) -> bool:
         """Check if a memory references entities that no longer exist."""
