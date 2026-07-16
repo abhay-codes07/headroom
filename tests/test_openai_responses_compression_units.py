@@ -1089,3 +1089,70 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_excluded_tool_array_output_preserves_content_part_shape():
+    """Regression for #2235: a losslessly-foldable excluded-tool output that is a
+    *list of content parts* must stay a list. The excluded fold used to join the
+    parts, compact the joined text, and write it back through the ("output", None)
+    slot, which replaced the whole array with a plain string, dropping part
+    count/order/types, images, and non-text metadata. Text parts must instead be
+    folded in place.
+    """
+    import json
+
+    router = ContentRouter()
+    handler = _handler_with_router(router)
+
+    # A pretty-printed JSON object: >200 chars and data-lossless-minifiable, so
+    # the excluded fold (grep is excluded-but-not-verbatim) actually shrinks it.
+    big_json = json.dumps(
+        {
+            "matches": [
+                {"file": f"src/f{i}.py", "line": i, "text": f"def foo(): return {i}"}
+                for i in range(20)
+            ]
+        },
+        indent=2,
+    )
+    image_part = {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "output_text", "text": big_json},
+                    dict(image_part),
+                ],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, reason, _, _, _ = (
+        handler._compress_openai_responses_payload(
+            payload,
+            model="gpt-5",
+            request_id="req_2235",
+        )
+    )
+
+    assert modified is True
+    assert reason is None
+    assert "router:excluded:lossless" in transforms
+
+    out = new_payload["input"][1]["output"]
+    # Shape preserved: still a two-part list, same order and types.
+    assert isinstance(out, list)
+    assert len(out) == 2
+    assert [p.get("type") for p in out] == ["output_text", "input_image"]
+    # The image part is untouched.
+    assert out[1] == image_part
+    # The text part shrank in place and remains data-equal (lossless minify).
+    assert isinstance(out[0]["text"], str)
+    assert len(out[0]["text"]) < len(big_json)
+    assert json.loads(out[0]["text"]) == json.loads(big_json)
+    # The originating function_call item is unchanged.
+    assert new_payload["input"][0] == payload["input"][0]

@@ -1609,10 +1609,38 @@ class OpenAIHandlerMixin:
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
-                    excl_out = _responses_part_text(item.get("output"))
-                    fold = router._lossless_compact_excluded(excl_out) if excl_out else None
-                    if fold is not None:
-                        lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
+                    #
+                    # Preserve the Responses content-part shape (#2235): when
+                    # `output` is a list of parts (e.g. an output_text alongside
+                    # an input_image), fold each text part in place via an
+                    # ("output_part", index) slot. Collapsing the joined text into
+                    # a single ("output", None) write-back would turn the array
+                    # into a string, dropping part count/order/types, images, and
+                    # any non-text metadata. Only a plain string `output` uses the
+                    # whole-value slot.
+                    output_val = item.get("output")
+                    did_fold = False
+                    if isinstance(output_val, str):
+                        fold = router._lossless_compact_excluded(output_val) if output_val else None
+                        if fold is not None:
+                            lossless_excluded.append((idx, ("output", None), fold[0], output_val))
+                            did_fold = True
+                    elif isinstance(output_val, list):
+                        for part_index, part in enumerate(output_val):
+                            if not (
+                                isinstance(part, dict)
+                                and part.get("type") in {"input_text", "output_text"}
+                                and isinstance(part.get("text"), str)
+                                and part["text"]
+                            ):
+                                continue
+                            part_text = part["text"]
+                            part_fold = router._lossless_compact_excluded(part_text)
+                            if part_fold is not None:
+                                lossless_excluded.append(
+                                    (idx, ("output_part", part_index), part_fold[0], part_text)
+                                )
+                                did_fold = True
                     if debug_enabled:
                         extraction_debug.append(
                             {
@@ -1620,7 +1648,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if did_fold
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,
