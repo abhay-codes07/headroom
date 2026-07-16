@@ -7030,16 +7030,26 @@ class OpenAIHandlerMixin:
                                             event_buffer.clear()
 
                                     elif event_type == "response.completed":
-                                        # No output items at all — flush
+                                        # No output items at all — flush the
+                                        # buffered events, record this response's
+                                        # metrics, and reset for the next one.
                                         decided = True
-                                for buf in event_buffer:
-                                    await websocket.send_text(buf)
-                                event_buffer.clear()
-                                await _record_ws_response_metrics()
-                                _reset()
-                                response_completed_seen = True
+                                        for buf in event_buffer:
+                                            await websocket.send_text(buf)
+                                        event_buffer.clear()
+                                        await _record_ws_response_metrics()
+                                        _reset()
+                                        response_completed_seen = True
 
-                                continue
+                                    # Phase 1 has fully handled this event (still
+                                    # buffering, or the decision above), so wait for
+                                    # the next one. This flush/record/reset used to
+                                    # sit here at Phase-1's own indent, running on
+                                    # EVERY event — memory-tool suppression never
+                                    # took effect, per-response metrics were recorded
+                                    # per-event, and the suppress/pass-through phases
+                                    # below were unreachable.
+                                    continue
 
                                 # --- Phase 2a: Suppress mode (memory response) ---
                                 if suppress_response:
