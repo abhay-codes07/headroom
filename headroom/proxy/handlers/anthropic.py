@@ -2642,9 +2642,18 @@ class AnthropicHandlerMixin:
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
-                        uncached_input_tokens = max(
-                            0, attempted_input_tokens - cr_tokens - cw_tokens
-                        )
+                        # The backend already reports Anthropic-shaped usage where
+                        # ``input_tokens`` is the uncached count (prompt tokens
+                        # minus cache read/creation; see
+                        # ``_anthropic_usage_from_litellm`` / #1345). Use it
+                        # directly, matching the direct-API path below. Re-deriving
+                        # it as ``attempted_input_tokens - cache`` was wrong:
+                        # ``attempted_input_tokens`` is the live-zone tokenizer
+                        # count kept for the compression-ratio denominator, not the
+                        # full request size, so on any multi-turn request whose
+                        # cached prefix is larger than the new turn it underflowed
+                        # to 0 and reported uncached=0 for real uncached input.
+                        uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
 
                         # Update prefix cache tracker for next turn. Mirrors the
                         # direct-Anthropic-API branch below (~line 3011) — without
