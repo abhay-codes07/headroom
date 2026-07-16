@@ -706,6 +706,13 @@ class StreamingMixin:
             if not hash_key:
                 continue
 
+            # The store keys every entry by a lowercase hash (see
+            # compression_store: sha256 hexdigest / explicit_hash.lower()), so a
+            # model that echoes the marker hash uppercase would miss the lookup
+            # and the retrieval feedback would never reach TOIN. Normalise here,
+            # matching parse_tool_call.
+            hash_key = hash_key.lower()
+
             logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
 
             # Call store.retrieve() for the side effect of triggering the
@@ -779,6 +786,10 @@ class StreamingMixin:
             hash_key = input_data.get("hash")
             if not hash_key:
                 continue
+
+            # Normalise to the store's lowercase key form (see
+            # _record_ccr_feedback_from_response).
+            hash_key = hash_key.lower()
 
             logger.info(
                 f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
