@@ -217,6 +217,40 @@ async def test_compress_batch_jsonl_without_optimization_handles_invalid_lines(
 
 
 @pytest.mark.asyncio
+async def test_compress_batch_jsonl_handles_non_object_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A JSONL line that is valid JSON but not a request object (array/string/
+    # null), or a request whose `body` isn't a dict, must pass through instead
+    # of crashing the whole batch (`.get` on a non-dict raises AttributeError,
+    # which the JSONDecodeError guard does not catch).
+    install_batch_support_modules(monkeypatch, tokenizer_count=12)
+    handler = DummyBatchHandler()
+    content = "\n".join(
+        [
+            json.dumps(
+                {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}}
+            ),
+            json.dumps([1, 2, 3]),
+            json.dumps("hello"),
+            "null",
+            json.dumps({"body": "not-a-dict"}),
+        ]
+    )
+
+    lines, stats = await handler._compress_batch_jsonl(content, "req-1")
+
+    assert len(lines) == 5
+    assert json.loads(lines[1]) == [1, 2, 3]
+    assert json.loads(lines[2]) == "hello"
+    assert json.loads(lines[3]) is None
+    assert json.loads(lines[4]) == {"body": "not-a-dict"}
+    assert stats["total_requests"] == 5
+    # None of these are JSON decode errors, so the error counter stays at 0.
+    assert stats["errors"] == 0
+
+
+@pytest.mark.asyncio
 async def test_compress_batch_jsonl_uses_pipeline_and_ccr_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
