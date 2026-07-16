@@ -4887,10 +4887,14 @@ class OpenAIHandlerMixin:
                         for fc in memory_fc_items:
                             call_id = fc.get("call_id", fc.get("id", ""))
                             name = fc.get("name", "")
-                            args_str = fc.get("arguments", "{}")
+                            # `or "{}"` guards a null `arguments`: json.loads(None)
+                            # raises TypeError, which the JSONDecodeError catch
+                            # below would miss (matches parse_tool_call, which
+                            # already handles this).
+                            args_str = fc.get("arguments") or "{}"
                             try:
                                 args = json.loads(args_str)
-                            except json.JSONDecodeError:
+                            except (json.JSONDecodeError, TypeError):
                                 args = {}
 
                             await self.memory_handler._ensure_initialized()
@@ -7068,10 +7072,13 @@ class OpenAIHandlerMixin:
                                             for fc in pending_fcs:
                                                 call_id = fc.get("call_id", fc.get("id", ""))
                                                 fc_name = fc.get("name", "")
-                                                args_str = fc.get("arguments", "{}")
+                                                # `or "{}"` guards a null `arguments`
+                                                # (json.loads(None) raises TypeError,
+                                                # which the JSONDecodeError catch misses).
+                                                args_str = fc.get("arguments") or "{}"
                                                 try:
                                                     fc_args = json.loads(args_str)
-                                                except json.JSONDecodeError:
+                                                except (json.JSONDecodeError, TypeError):
                                                     fc_args = {}
 
                                                 await self.memory_handler._ensure_initialized()
