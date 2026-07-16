@@ -703,7 +703,10 @@ class StreamingMixin:
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
 
-            if not hash_key:
+            # The payload is parsed straight from model output, so `hash` may be
+            # missing or a non-string (e.g. {"hash": 123}). Skip anything that
+            # isn't a usable string rather than letting `.lower()` raise.
+            if not isinstance(hash_key, str) or not hash_key:
                 continue
 
             # The store keys every entry by a lowercase hash (see
@@ -784,7 +787,9 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
-            if not hash_key:
+            # Skip a missing or non-string hash (malformed model output) instead
+            # of raising in `.lower()`.
+            if not isinstance(hash_key, str) or not hash_key:
                 continue
 
             # Normalise to the store's lowercase key form (see

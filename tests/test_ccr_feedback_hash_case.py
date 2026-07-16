@@ -76,3 +76,53 @@ def test_openai_stream_feedback_lowercases_hash(monkeypatch):
     handler._record_ccr_feedback_from_openai_sse(sse, "req-1")
 
     assert spy.looked_up == [HASH_LOWER]
+
+
+def test_response_feedback_ignores_non_string_hash(monkeypatch):
+    # A malformed non-string hash (e.g. {"hash": 123}) must be skipped, not
+    # raise in .lower().
+    spy = _SpyStore()
+    monkeypatch.setattr(cs, "get_compression_store", lambda: spy)
+
+    handler = object.__new__(StreamingMixin)
+    response = {
+        "content": [{"type": "tool_use", "name": "headroom_retrieve", "input": {"hash": 123}}]
+    }
+    handler._record_ccr_feedback_from_response(response, "anthropic", "req-1")
+
+    assert spy.looked_up == []
+
+
+def test_openai_stream_feedback_ignores_non_string_hash(monkeypatch):
+    import json
+
+    spy = _SpyStore()
+    monkeypatch.setattr(cs, "get_compression_store", lambda: spy)
+
+    handler = object.__new__(StreamingMixin)
+    sse = (
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "name": "headroom_retrieve",
+                                        "arguments": json.dumps({"hash": 123}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        + "\n"
+    )
+    handler._record_ccr_feedback_from_openai_sse(sse, "req-1")
+
+    assert spy.looked_up == []
