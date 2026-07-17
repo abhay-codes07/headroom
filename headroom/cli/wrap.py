@@ -7665,7 +7665,7 @@ def _resolve_opencode_binary(custom: str | None) -> tuple[str | None, str]:
     requested = custom or os.environ.get("HEADROOM_OPENCODE_BIN") or "opencode"
     candidate = Path(requested).expanduser()
     if candidate.is_file():
-        return str(candidate), requested
+        return str(candidate.resolve()), requested
     return shutil.which(requested), requested
 
 

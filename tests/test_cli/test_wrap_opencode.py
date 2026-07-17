@@ -424,6 +424,36 @@ def test_wrap_opencode_custom_binary_env_var(
     assert captured["binary"] == "/opt/rolandcode"
 
 
+def test_wrap_opencode_custom_binary_relative_path(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing relative binary path launches by path, not by PATH lookup."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_BIN", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    local_bin = tmp_path / "rolandcode"
+    local_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value=None):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                result = runner.invoke(
+                    main,
+                    ["wrap", "opencode", "--no-mcp", "--opencode-bin", "./rolandcode"],
+                )
+
+    assert result.exit_code == 0, result.output
+    assert captured["binary"] == str(local_bin.resolve())
+
+
 def test_wrap_opencode_missing_custom_binary_names_it(
     runner: CliRunner,
     tmp_path: Path,
