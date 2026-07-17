@@ -5711,6 +5711,100 @@ def vibe(
 
 
 # =============================================================================
+# Generic OpenAI-compatible CLI
+# =============================================================================
+
+
+@wrap.command(name="openai-compatible", context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--bin",
+    "bin_name",
+    required=True,
+    metavar="NAME_OR_PATH",
+    help="The OpenAI-compatible CLI to launch (a command on PATH or a path to it).",
+)
+@click.option(
+    "--base-url-env",
+    default="OPENAI_BASE_URL",
+    metavar="VAR",
+    help=(
+        "Environment variable the CLI reads for its API base URL "
+        "(default OPENAI_BASE_URL; some tools use OPENAI_API_BASE)."
+    ),
+)
+@click.option(
+    "--upstream",
+    default="https://api.openai.com/v1",
+    metavar="URL",
+    help="Real upstream the proxy forwards to (default https://api.openai.com/v1).",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("tool_args", nargs=-1, type=click.UNPROCESSED)
+def openai_compatible(
+    port: int,
+    bin_name: str,
+    base_url_env: str,
+    upstream: str,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    tool_args: tuple,
+) -> None:
+    """Wrap any OpenAI-compatible CLI that reads its API base URL from an env var.
+
+    A generic escape hatch for tools that do not (yet) have a dedicated
+    ``headroom wrap <tool>`` command — OpenAI-compatible agents and forks. It
+    points the CLI's base-URL env var at the local Headroom proxy so its
+    ``/v1/chat/completions`` and ``/v1/responses`` traffic is compressed, and
+    forwards upstream to ``--upstream``. The CLI's own credentials are passed
+    through unchanged.
+
+    \b
+    Examples:
+        headroom wrap openai-compatible --bin devin
+        headroom wrap openai-compatible --bin mycli --base-url-env OPENAI_API_BASE
+        headroom wrap openai-compatible --bin mycli --upstream https://api.example.com/v1
+    """
+    if prepare_only:
+        return
+
+    candidate = Path(bin_name).expanduser()
+    tool_bin = str(candidate) if candidate.is_file() else shutil.which(bin_name)
+    if not tool_bin:
+        click.echo(f"Error: '{bin_name}' not found in PATH.")
+        raise SystemExit(1)
+
+    from headroom.providers.codex.runtime import proxy_base_url
+
+    base_url = proxy_base_url(port)
+    env = dict(os.environ)
+    env[base_url_env] = base_url
+
+    _launch_tool(
+        binary=tool_bin,
+        args=tool_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OPENAI-COMPAT",
+        env_vars_display=[f"{base_url_env}={base_url}"],
+        learn=learn,
+        memory=memory,
+        agent_type="openai-compatible",
+        openai_api_url=upstream,
+    )
+
+
+# =============================================================================
 # Kimi CLI
 # =============================================================================
 
