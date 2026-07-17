@@ -423,9 +423,15 @@ class GeminiHandlerMixin:
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usageMetadata", {})
-                    total_input_tokens = usage.get("promptTokenCount", 0)
-                    output_tokens = usage.get("candidatesTokenCount", 0)
-                    cache_read_tokens = usage.get("cachedContentTokenCount", 0)
+                    # int(... or 0)-guard: Gemini omits or nulls these counts on
+                    # some responses (e.g. a safety-blocked turn with no
+                    # candidates). A present-null leaves .get returning None, and
+                    # the max(0, prompt - cache_read) below (and RequestOutcome's
+                    # int output_tokens) would then raise TypeError on the
+                    # non-error path. Mirrors the streaming _usage_int guard.
+                    total_input_tokens = int(usage.get("promptTokenCount", 0) or 0)
+                    output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
+                    cache_read_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
                 except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
                     pass
                 await self._record_request_outcome(
@@ -666,11 +672,19 @@ class GeminiHandlerMixin:
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usageMetadata", {})
-                    total_input_tokens = usage.get("promptTokenCount", optimized_tokens)
-                    output_tokens = usage.get("candidatesTokenCount", 0)
+                    # int(... or fallback)-guard: Gemini omits or nulls these
+                    # counts on some responses (e.g. a safety-blocked turn with no
+                    # candidates). A present-null leaves .get returning None, and
+                    # the max(0, prompt - cache_read) below (plus RequestOutcome's
+                    # int output_tokens) would then raise TypeError on the
+                    # non-error path. Mirrors the streaming _usage_int guard.
+                    total_input_tokens = int(
+                        usage.get("promptTokenCount", optimized_tokens) or optimized_tokens
+                    )
+                    output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
                     # Gemini returns cachedContentTokenCount for context-cached tokens
                     # These are charged at 10-25% of the input price depending on model
-                    cache_read_tokens = usage.get("cachedContentTokenCount", 0)
+                    cache_read_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
                 except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
                     # A non-JSON upstream body (HTML/empty error page from an
                     # overloaded Google/Vertex frontend) makes response.json()
