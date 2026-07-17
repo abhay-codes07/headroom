@@ -1014,7 +1014,8 @@ class TrafficLearner:
           truncation past ``max_chars``.
         """
 
-        cleaned = self._strip_system_reminders(user_text)[:500]
+        cleaned = self._strip_system_reminders(user_text)
+        cleaned = self._strip_injected_memory_context(cleaned)[:500]
         correction = self._find_correction(cleaned)
         if correction is None:
             return []
@@ -1172,6 +1173,25 @@ class TrafficLearner:
                 break
             cursor = close_start + len(close_tag)
         return "".join(out)
+
+    @staticmethod
+    def _strip_injected_memory_context(text: str) -> str:
+        """Remove Headroom's own injected memory-context block from user text.
+
+        The proxy appends a ``## Relevant Memories…`` block (see
+        ``MemoryHandler._format_memory_block_header``) to the latest user turn
+        before forwarding. That block echoes previously-learned
+        ``User preference:`` lines, so feeding it back to preference extraction
+        lets the learner re-ingest its own memories as fresh evidence — a
+        self-reinforcing loop that inflates evidence counts (#2274). The block
+        is always appended last, so everything from the header to end-of-text is
+        Headroom-authored, not user-authored, and is dropped. A genuine user
+        correction that precedes the block is preserved.
+        """
+        if not text:
+            return text
+        idx = text.find("## Relevant Memories")
+        return text if idx < 0 else text[:idx]
 
     # =========================================================================
     # Pattern Accumulation & Persistence

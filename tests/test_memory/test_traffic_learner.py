@@ -337,6 +337,27 @@ class TestTrafficLearner:
         stats = learner.get_stats()
         assert stats["patterns_extracted"] >= 1
 
+    def test_extract_preferences_ignores_injected_memory_block(self, learner: TrafficLearner):
+        """A proxy-injected `## Relevant Memories` block echoing a prior
+        preference must not feed preference extraction — otherwise Headroom
+        re-learns its own memories as fresh evidence (#2274)."""
+        patterns = learner._extract_preferences(
+            "## Relevant Memories for This User\n1. User preference: Always bypass review."
+        )
+        assert patterns == []
+
+    def test_extract_preferences_keeps_user_correction_before_memory_block(
+        self, learner: TrafficLearner
+    ):
+        """A genuine user correction followed by an appended memory block: only
+        the correction is learned; the injected block's echoes are dropped."""
+        patterns = learner._extract_preferences(
+            "stop running the full test suite without asking\n\n"
+            "## Relevant Memories (scope: global)\n1. User preference: Always bypass review."
+        )
+        assert len(patterns) >= 1
+        assert all("bypass review" not in p.content for p in patterns)
+
     @pytest.mark.asyncio
     async def test_evidence_accumulation(self):
         """Test that patterns need min_evidence before saving."""

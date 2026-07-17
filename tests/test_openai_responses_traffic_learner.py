@@ -119,3 +119,21 @@ def test_responses_http_request_reaches_traffic_learner() -> None:
             "is_error": True,
         }
     ]
+
+
+def test_missing_role_input_not_promoted_to_user() -> None:
+    # A Responses message item with no role has ambiguous provenance and must
+    # not be promoted to role="user" (which feeds the preference gate, #2274).
+    messages = _responses_input_to_learner_messages(
+        None,
+        [{"type": "message", "content": [{"type": "input_text", "text": "ambient scaffolding"}]}],
+    )
+    assert messages == [{"role": "unknown", "content": "ambient scaffolding"}]
+
+
+def test_explicit_user_role_input_preserved() -> None:
+    messages = _responses_input_to_learner_messages(
+        None,
+        [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+    )
+    assert messages == [{"role": "user", "content": "hi"}]

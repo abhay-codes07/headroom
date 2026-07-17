@@ -826,8 +826,13 @@ def _responses_input_to_learner_messages(
         text = _responses_part_text(item.get("content"))
         if text:
             role = item.get("role")
+            # Preserve provenance: a Responses item with a missing/blank role has
+            # ambiguous authorship, so do NOT promote it to ``user`` — that would
+            # let harness scaffolding feed TrafficLearner's user-role preference
+            # gate (#2274). ``unknown`` fails closed for preference learning while
+            # staying available to the role-agnostic tool-result extraction.
             messages.append(
-                {"role": role if isinstance(role, str) and role else "user", "content": text}
+                {"role": role if isinstance(role, str) and role else "unknown", "content": text}
             )
     return messages
 
