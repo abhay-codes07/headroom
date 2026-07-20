@@ -3242,13 +3242,20 @@ class AnthropicHandlerMixin:
                     uncached_input_tokens = 0
                     if resp_json:
                         usage = resp_json.get("usage", {})
-                        output_tokens = usage.get("output_tokens", 0)
-                        cr_tokens = usage.get("cache_read_input_tokens", 0)
-                        cw_tokens = usage.get("cache_creation_input_tokens", 0)
+                        # `.get(key, default)` only falls back when the key is
+                        # absent; a present-but-null count (an Anthropic-compatible
+                        # gateway behind a custom ANTHROPIC_TARGET_API_URL can emit
+                        # these on a stopped/empty turn) returns None and crashes
+                        # the `max(...)` cache-bust arithmetic below and the
+                        # int-typed outcome/metrics. Coerce like the TTL helper and
+                        # the gemini fix in #2347.
+                        output_tokens = int(usage.get("output_tokens", 0) or 0)
+                        cr_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                        cw_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
-                        uncached_input_tokens = usage.get("input_tokens", 0)
+                        uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
 
                     # Track cache bust: tokens that lost their cache discount due to compression.
                     # If we had X tokens cached last turn and only Y hit cache this turn,
