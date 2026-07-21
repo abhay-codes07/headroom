@@ -514,7 +514,12 @@ def _strip_fenced_json(raw: str) -> dict:
 
     # Nothing parsed as an object: re-raise the natural error on the raw text
     # so callers see a JSONDecodeError, preserving the documented contract.
-    result: dict = json.loads(text)
+    # json.loads raises for invalid JSON, but valid JSON that is not an object
+    # (e.g. a bare array the model emitted) would otherwise be returned as a
+    # non-dict and crash callers that do `.get(...)`, so reject it explicitly.
+    result = json.loads(text)
+    if not isinstance(result, dict):
+        raise json.JSONDecodeError("Expected a JSON object", text, 0)
     return result
 
 

@@ -592,6 +592,19 @@ class TestStripFencedJson:
         with pytest.raises(json.JSONDecodeError):
             _strip_fenced_json("not json at all")
 
+    def test_non_object_json_raises(self):
+        # A model may return valid JSON that is not an object (a bare array,
+        # string, number, ...). The contract is to raise JSONDecodeError so
+        # callers do not receive a non-dict and crash on `.get`.
+        for raw in ("[1, 2, 3]", '["a", "b"]', '[{"a": 1}, {"b": 2}]', '"a string"', "42", "true"):
+            with pytest.raises(json.JSONDecodeError):
+                _strip_fenced_json(raw)
+
+    def test_array_wrapping_a_single_object_is_extracted(self):
+        # The lenient first-{ .. last-} slice still recovers a single object a
+        # model wrapped in an array; only genuinely object-less JSON raises.
+        assert _strip_fenced_json('[{"key": "value"}]') == {"key": "value"}
+
     def test_prose_preamble_before_fence(self):
         # Models sometimes add a preamble before the fence despite being told
         # to return JSON only (e.g. "Here it is:\n\n```json ...").
