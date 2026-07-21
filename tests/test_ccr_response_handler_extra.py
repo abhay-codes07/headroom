@@ -299,6 +299,42 @@ def test_streaming_buffer_and_parse_sse_helpers() -> None:
     )
 
 
+def test_reconstruct_openai_response_tolerates_null_tool_calls_and_function() -> None:
+    # Some OpenAI-compatible providers put ``"tool_calls": null`` (and
+    # ``"function": null``) in a streaming delta instead of omitting the key.
+    # Only checking key presence made the reconstruction iterate ``None`` and
+    # raise ``TypeError``, aborting the whole CCR round.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+
+    parsed = handler._reconstruct_openai_response(
+        [
+            {"choices": [{"delta": {"content": "Hi", "tool_calls": None}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": None}]}}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": "f", "arguments": "{}"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    message = parsed["choices"][0]["message"]
+    # The null frames did not crash, and the real tool call still reconstructs.
+    assert message["content"] == "Hi"
+    assert message["tool_calls"][0]["id"] == "call_1"
+    assert message["tool_calls"][0]["function"] == {"name": "f", "arguments": "{}"}
+
+
 @pytest.mark.asyncio
 async def test_streaming_handler_process_stream_pass_through_and_ccr(
     monkeypatch: pytest.MonkeyPatch,
