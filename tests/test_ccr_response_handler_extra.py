@@ -335,6 +335,24 @@ def test_reconstruct_openai_response_tolerates_null_tool_calls_and_function() ->
     assert message["tool_calls"][0]["function"] == {"name": "f", "arguments": "{}"}
 
 
+def test_extract_assistant_message_responses_output_null_coerces_to_list() -> None:
+    # A Responses turn with a present-but-null `output` (some gateways send this
+    # on an empty/filtered turn) must not become None: handle_response later
+    # does `current_messages.extend(...)` on it, which would raise TypeError.
+    handler = CCRResponseHandler()
+
+    assert handler._extract_assistant_message({"output": None}, "openai_responses") == {
+        "_openai_responses_output_items": []
+    }
+    # An absent output is also an empty list, and a real output passes through.
+    assert handler._extract_assistant_message({}, "openai_responses") == {
+        "_openai_responses_output_items": []
+    }
+    assert handler._extract_assistant_message(
+        {"output": [{"type": "message"}]}, "openai_responses"
+    ) == {"_openai_responses_output_items": [{"type": "message"}]}
+
+
 @pytest.mark.asyncio
 async def test_streaming_handler_process_stream_pass_through_and_ccr(
     monkeypatch: pytest.MonkeyPatch,

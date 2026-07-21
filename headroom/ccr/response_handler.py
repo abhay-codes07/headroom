@@ -399,7 +399,16 @@ class CCRResponseHandler:
             # echoed back verbatim as `input[]` items — not a single
             # role/content dict like chat completions. Sentinel key mirrors
             # `_openai_tool_results`; handle_response() extends on it.
-            return {"_openai_responses_output_items": response.get("output", [])}
+            # `.get("output", [])` only falls back when the key is absent, so a
+            # present-but-null `output` would return None and make the
+            # `current_messages.extend(...)` in handle_response raise TypeError;
+            # coerce to a list like the choices branch above.
+            output_items = response.get("output")
+            return {
+                "_openai_responses_output_items": output_items
+                if isinstance(output_items, list)
+                else []
+            }
         elif provider == "google":
             # Google/Gemini format: role is "model", content is in candidates[0].content.parts
             candidates = response.get("candidates", [])
