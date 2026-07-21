@@ -361,6 +361,28 @@ class TestLLMResponseParser:
         recs = _parse_llm_response(raw)
         assert recs == []
 
+    def test_handles_null_rule_lists_and_fields(self):
+        # The model controls this JSON. A present-but-null rules list or a null
+        # section/content must be treated like an absent value, not crash the
+        # iteration / `.strip()`.
+        assert _parse_llm_response({"context_file_rules": None, "memory_file_rules": None}) == []
+        assert (
+            _parse_llm_response({"context_file_rules": [{"section": None, "content": "x"}]}) == []
+        )
+        assert _parse_llm_response({"memory_file_rules": [{"section": "s", "content": None}]}) == []
+
+        # A valid rule alongside the null shapes is still parsed.
+        recs = _parse_llm_response(
+            {
+                "context_file_rules": [
+                    None,
+                    {"section": "Large Files", "content": "use offset", "evidence_count": 3},
+                ]
+            }
+        )
+        assert [r.section for r in recs] == ["Large Files"]
+        assert recs[0].evidence_count == 3
+
 
 # =============================================================================
 # Full Analyzer Integration Tests (mocked LLM)

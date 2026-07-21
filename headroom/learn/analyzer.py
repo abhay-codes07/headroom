@@ -825,11 +825,15 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     """Convert LLM structured output into Recommendation objects."""
     recommendations: list[Recommendation] = []
 
-    for rule in raw.get("context_file_rules", []):
+    # `.get(key, [])` / `.get(key, "")` only fall back when the key is absent;
+    # the model controls this JSON, so a present-but-null `*_file_rules` list or
+    # a null `section`/`content` would return None and crash the iteration /
+    # `.strip()`. Coerce with `or` so a null is treated like an absent value.
+    for rule in raw.get("context_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
-        content = rule.get("content", "").strip()
+        section = (rule.get("section") or "").strip()
+        content = (rule.get("content") or "").strip()
         if not section or not content:
             continue
         recommendations.append(
@@ -843,11 +847,11 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
             )
         )
 
-    for rule in raw.get("memory_file_rules", []):
+    for rule in raw.get("memory_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = rule.get("section", "").strip()
-        content = rule.get("content", "").strip()
+        section = (rule.get("section") or "").strip()
+        content = (rule.get("content") or "").strip()
         if not section or not content:
             continue
         recommendations.append(
