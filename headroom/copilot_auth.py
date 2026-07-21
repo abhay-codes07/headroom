@@ -178,7 +178,7 @@ def default_oauth_domain() -> str:
     return domain if domain else DEFAULT_GITHUB_HOST
 
 
-def _configured_api_url() -> str:
+def _configured_api_url_override() -> str | None:
     api_url = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
     if api_url:
         return api_url.rstrip("/")
@@ -187,6 +187,13 @@ def _configured_api_url() -> str:
     if enterprise_domain:
         return copilot_api_url_from_enterprise_url(enterprise_domain).rstrip("/")
 
+    return None
+
+
+def _configured_api_url() -> str:
+    configured = _configured_api_url_override()
+    if configured:
+        return configured
     return DEFAULT_API_URL
 
 
@@ -774,16 +781,25 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
 
 
 def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
+    configured = _configured_api_url_override()
+    if configured:
+        return configured
+
     api_url = _api_url_from_payload(payload)
     if not api_url:
-        return _configured_api_url()
+        return DEFAULT_API_URL
 
     host = urlparse(api_url).netloc.lower()
-    if host in {"api.githubcopilot.com", "api.individual.githubcopilot.com"}:
-        return _configured_api_url()
+    if host in {
+        "api.githubcopilot.com",
+        "api.individual.githubcopilot.com",
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+    }:
+        return DEFAULT_API_URL
     if host.endswith(".githubcopilot.com"):
         return api_url
-    return _configured_api_url()
+    return DEFAULT_API_URL
 
 
 def _subscription_api_url_from_user_info(oauth_token: str) -> str:
@@ -791,8 +807,8 @@ def _subscription_api_url_from_user_info(oauth_token: str) -> str:
 
 
 def _api_url_from_exchange_payload(payload: dict[str, Any], *, oauth_token: str) -> str:
-    configured = _configured_api_url()
-    if configured != DEFAULT_API_URL:
+    configured = _configured_api_url_override()
+    if configured:
         return configured
 
     api_url = _api_url_from_payload(payload)
@@ -1007,7 +1023,12 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
         # chat/responses and Anthropic messages all build their upstream URL
         # here), so mark the request for provider relabeling downstream.
         mark_request_routed_to_copilot()
-        if normalized_path.startswith("/v1/"):
+        # Copilot serves its OpenAI-compatible surface WITHOUT a ``/v1`` prefix
+        # (``/chat/completions``, ``/responses``, ...), so strip it there. But its
+        # Anthropic surface for Claude models IS ``/v1/messages`` (with the
+        # ``/v1``); stripping it forwarded ``/messages`` and Copilot returned 404
+        # for claude-* models (#2409). Keep ``/v1`` for the messages endpoint.
+        if normalized_path.startswith("/v1/") and not normalized_path.startswith("/v1/messages"):
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
