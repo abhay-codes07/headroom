@@ -371,6 +371,18 @@ class TestLLMResponseParser:
         )
         assert _parse_llm_response({"memory_file_rules": [{"section": "s", "content": None}]}) == []
 
+        # A truthy non-string section/content (number, list, object) is also
+        # model-controlled and must not crash `.strip()`; it is dropped like null.
+        assert _parse_llm_response({"context_file_rules": [{"section": 123, "content": "x"}]}) == []
+        assert _parse_llm_response({"context_file_rules": [{"section": "s", "content": 123}]}) == []
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": ["s"], "content": "x"}]}) == []
+        )
+        assert (
+            _parse_llm_response({"memory_file_rules": [{"section": "s", "content": {"a": 1}}]})
+            == []
+        )
+
         # A valid rule alongside the null shapes is still parsed.
         recs = _parse_llm_response(
             {

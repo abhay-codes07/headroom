@@ -827,13 +827,14 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
 
     # `.get(key, [])` / `.get(key, "")` only fall back when the key is absent;
     # the model controls this JSON, so a present-but-null `*_file_rules` list or
-    # a null `section`/`content` would return None and crash the iteration /
-    # `.strip()`. Coerce with `or` so a null is treated like an absent value.
+    # a non-string `section`/`content` would crash the iteration / `.strip()`.
+    # `_as_str` coerces any non-string (null, number, list, object) to "" so a
+    # malformed field is treated like an absent one instead of raising.
     for rule in raw.get("context_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = (rule.get("section") or "").strip()
-        content = (rule.get("content") or "").strip()
+        section = _as_str(rule.get("section")).strip()
+        content = _as_str(rule.get("content")).strip()
         if not section or not content:
             continue
         recommendations.append(
@@ -850,8 +851,8 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     for rule in raw.get("memory_file_rules") or []:
         if not isinstance(rule, dict):
             continue
-        section = (rule.get("section") or "").strip()
-        content = (rule.get("content") or "").strip()
+        section = _as_str(rule.get("section")).strip()
+        content = _as_str(rule.get("content")).strip()
         if not section or not content:
             continue
         recommendations.append(
@@ -869,6 +870,17 @@ def _parse_llm_response(raw: dict) -> list[Recommendation]:
     recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
 
     return recommendations
+
+
+def _as_str(val: object) -> str:
+    """Return ``val`` if it is a string, else ``""``.
+
+    Fields like ``section``/``content`` come straight from model-controlled JSON,
+    where a number/list/object is as possible as a string. Coercing a non-string
+    to empty keeps ``.strip()`` from raising and lets the caller's emptiness check
+    drop the malformed rule.
+    """
+    return val if isinstance(val, str) else ""
 
 
 def _safe_int(val: object) -> int:
