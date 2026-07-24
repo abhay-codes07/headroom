@@ -76,3 +76,48 @@ def test_grok_discover_projects_survives_permission_error(
     # Discovery completes; the unreadable context file is simply treated as absent.
     assert len(projects) == 1
     assert projects[0].context_file is None
+
+
+def test_opencode_discover_projects_survives_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from headroom.learn.plugins.opencode import OpenCodePlugin
+
+    db_path = tmp_path / "opencode.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT);
+            CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, time_created INTEGER);
+            """
+        )
+        conn.execute(
+            "INSERT INTO project (id, name, worktree) VALUES (?, ?, ?)",
+            ("p1", "Proj", "/restricted/worktree"),
+        )
+        conn.execute(
+            "INSERT INTO session (id, project_id, time_created) VALUES (?, ?, ?)",
+            ("s1", "p1", 1_700_000_000_000),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The recorded worktree is behind a restricted parent: the AGENTS.md probe
+    # stats it. Only that probe blows up so the DB open still works.
+    real_exists = Path.exists
+
+    def _boom(self: Path) -> bool:
+        if self.name == "AGENTS.md":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _boom)
+
+    plugin = OpenCodePlugin(db_path=db_path)
+    projects = plugin.discover_projects()
+    assert len(projects) == 1
+    assert projects[0].context_file is None
