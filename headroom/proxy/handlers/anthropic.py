@@ -68,6 +68,33 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _model_to_persist_in_body(
+    body_model: Any, resolved_model: Any, *, has_backend: bool
+) -> str | None:
+    """Return the model to write into ``body["model"]``, or ``None`` to leave it.
+
+    Two cases persist the resolved model:
+
+    - An existing string ``body["model"]`` that sanitized to something different
+      (ANSI / display-style suffix stripped) — the long-standing behavior.
+    - No ``body["model"]`` at all when a backend will consume the body (#2363).
+      Vertex rawPredict (and other provider-URL request shapes) carry the model
+      only in the URL path — surfaced as ``model_override`` — with no body
+      model. ``LiteLLMBackend`` / ``BedrockBackend`` read ``body["model"]`` and
+      otherwise fall back to a hardcoded default, so every such request was
+      silently sent as the wrong model. A native passthrough (no backend)
+      forwards the URL model and must NOT gain a body model the upstream would
+      reject, so it is left untouched.
+    """
+    if not isinstance(resolved_model, str) or not resolved_model:
+        return None
+    if isinstance(body_model, str):
+        return resolved_model if resolved_model != body_model else None
+    if body_model is None and has_backend and resolved_model != "unknown":
+        return resolved_model
+    return None
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -700,8 +727,13 @@ class AnthropicHandlerMixin:
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
             body_model = body.get("model")
-            if isinstance(body_model, str) and model != body_model:
-                body["model"] = model
+            _model_to_persist = _model_to_persist_in_body(
+                body_model,
+                model,
+                has_backend=getattr(self, "anthropic_backend", None) is not None,
+            )
+            if _model_to_persist is not None:
+                body["model"] = _model_to_persist
                 body_mutation_tracker.mark_mutated("sanitize_model_id")
             messages = body.get("messages", [])
             # Strip streaming-only "index" keys from request content blocks BEFORE any
