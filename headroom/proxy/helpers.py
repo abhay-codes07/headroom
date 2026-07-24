@@ -2287,6 +2287,43 @@ def should_inject_ccr_tool(
     )
 
 
+def history_references_ccr_tool(messages: Any) -> bool:
+    """True when the request history already contains a ``headroom_retrieve`` call.
+
+    Anthropic emits it as an assistant ``tool_use`` content block; OpenAI as an
+    assistant ``tool_calls[].function.name``. When such a reference is present in
+    history but the tool is not re-declared in ``tools``, the provider rejects
+    the whole request (``400 Tool reference 'headroom_retrieve' not found``,
+    #2440). Used to force sticky re-injection on the sessionless path.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == CCR_TOOL_NAME
+                ):
+                    return True
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                if name == CCR_TOOL_NAME:
+                    return True
+    return False
+
+
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -2294,6 +2331,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    history_has_ccr_reference: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2342,9 +2380,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    # No session_id (e.g. WS path): per-turn decision drives directly.
+    # No session_id (e.g. WS path): the per-turn flag drives the decision, but
+    # a headroom_retrieve tool_use already sitting in history must ALSO force
+    # re-injection. Without a session the tracker can't remember a prior turn's
+    # CCR, so a later turn with no fresh compression would drop the tool
+    # definition and the provider rejects the request because history still
+    # references it (#2440).
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not (has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2358,7 +2401,9 @@ def apply_session_sticky_ccr_tool(
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
-            decision="inject_first_time",
+            decision="inject_first_time"
+            if has_compressed_content_this_turn
+            else "inject_history_reference",
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )

@@ -1904,7 +1904,10 @@ class AnthropicHandlerMixin:
                             f"(frozen_message_count={frozen_message_count}); injecting to "
                             "prevent unredeemable markers (#1006)"
                         )
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        history_references_ccr_tool,
+                    )
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
@@ -1912,6 +1915,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=has_new_compressed_content,
+                        history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                     )
                     if ccr_tool_injected:
                         logger.debug(
