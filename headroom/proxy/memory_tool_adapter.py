@@ -798,7 +798,10 @@ class MemoryToolAdapter:
         first = choices[0] if isinstance(choices, list) and choices else None
         message = first.get("message") if isinstance(first, dict) else None
         if isinstance(message, dict):
-            return list(message.get("tool_calls", []) or [])
+            # Filter to dict entries: downstream (_get_tool_name /
+            # _get_tool_input) calls `.get` on each element, so a null / string
+            # element inside tool_calls would still crash the same path.
+            return [tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)]
         return []
 
     def _get_tool_name(self, tool_call: dict[str, Any], provider: Provider) -> str:
