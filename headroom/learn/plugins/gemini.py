@@ -19,6 +19,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import ContextWriter, GeminiWriter
+from ._paths import path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +90,9 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
             project_path = self._detect_project_path(session_files[0])
 
             gemini_md = None
-            if project_path and project_path.exists():
+            if project_path and path_exists(project_path):
                 candidate = project_path / "GEMINI.md"
-                if candidate.exists():
+                if path_exists(candidate):
                     gemini_md = candidate
 
             projects.append(
@@ -321,10 +322,10 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
         if isinstance(data, dict):
             project_path = data.get("projectPath", data.get("project_path", ""))
-            if project_path and Path(project_path).exists():
+            if project_path and path_exists(Path(project_path)):
                 return Path(project_path)
             cwd = data.get("cwd", data.get("workingDirectory", ""))
-            if cwd and Path(cwd).exists():
+            if cwd and path_exists(Path(cwd)):
                 return Path(cwd)
 
         return None
