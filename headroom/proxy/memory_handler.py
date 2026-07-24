@@ -1077,7 +1077,12 @@ your responses, not to drive new actions."""
             if isinstance(first, dict):
                 message = first.get("message")
                 if isinstance(message, dict):
-                    tc_list = list(message.get("tool_calls", []) or [])
+                    # Filter to dict entries: a null / string element inside
+                    # tool_calls (which downstream immediately calls `.get` on)
+                    # would otherwise still crash detection.
+                    tc_list = [
+                        tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)
+                    ]
                     if tc_list:
                         return tc_list
 

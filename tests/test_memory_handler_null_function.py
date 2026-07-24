@@ -63,3 +63,25 @@ def test_extract_tool_calls_survives_non_dict_anthropic_block():
     response = {"content": [None, {"type": "tool_use", "id": "t1", "name": "memory_save"}]}
     calls = _handler._extract_tool_calls(response, "anthropic")
     assert [c["id"] for c in calls] == ["t1"]
+
+
+def test_extract_tool_calls_skips_non_dict_openai_tool_call_elements():
+    # A null / string element inside message.tool_calls is passed straight to
+    # `.get` downstream (has_memory_tool_calls / handle_memory_tool_calls), so a
+    # malformed element must be dropped while a valid tool call is still seen.
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        None,
+                        "oops",
+                        {"id": "c1", "type": "function", "function": {"name": "memory_save"}},
+                    ]
+                }
+            }
+        ]
+    }
+    calls = _handler._extract_tool_calls(response, "openai")
+    assert [c["id"] for c in calls] == ["c1"]
+    assert _handler.has_memory_tool_calls(response, "openai") is True
