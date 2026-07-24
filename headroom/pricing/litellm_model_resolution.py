@@ -2,8 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+
+# Vertex AI model ids carry a date-stamped version suffix
+# (``claude-opus-4@20250514``) that LiteLLM's cost DB does not key on, so a
+# verbatim lookup misses and cost reads $0 (#2515). Stripping it yields the
+# bare Anthropic key that IS priced.
+_VERSION_SUFFIX_RE = re.compile(r"@\d{8}$")
+
+# Vertex-routed Claude/Gemini keys live under this LiteLLM provider prefix, both
+# with the version suffix (``vertex_ai/claude-opus-4@20250514``) and, for some
+# models, only as the bare Anthropic key after stripping.
+_VERTEX_PREFIX = "vertex_ai/"
+
+
+def _strip_version_suffix(model: str) -> str:
+    """Drop a trailing Vertex ``@YYYYMMDD`` model-version suffix (#2515).
+
+    Returns ``model`` unchanged when there is no such suffix, so non-Vertex
+    model names keep their existing candidate lists exactly.
+    """
+    return _VERSION_SUFFIX_RE.sub("", model)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,16 +76,29 @@ PRICE_LOOKUP_PROVIDER_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _prefix_rule_candidates(name: str) -> list[str]:
+    return [
+        candidate
+        for rule in MODEL_PREFIX_RULES
+        for candidate in (rule.candidate_for(name),)
+        if candidate is not None
+    ]
+
+
 def resolution_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM keys to try for cost-per-token resolution."""
     candidates = [model]
-    candidates.extend(
-        candidate
-        for rule in MODEL_PREFIX_RULES
-        for candidate in (rule.candidate_for(model),)
-        if candidate is not None
-    )
-    alias = MODEL_ALIASES.get(model)
+    bare = _strip_version_suffix(model)
+    if bare != model:
+        # Vertex keeps the suffix on its own key; try it right after the exact
+        # name, then fall back to the version-stripped bare name (#2515).
+        candidates.append(f"{_VERTEX_PREFIX}{model}")
+    candidates.extend(_prefix_rule_candidates(model))
+    if bare != model:
+        candidates.append(bare)
+        candidates.extend(_prefix_rule_candidates(bare))
+        candidates.append(f"{_VERTEX_PREFIX}{bare}")
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:
         candidates.append(alias)
     return tuple(dict.fromkeys(candidates))
@@ -73,8 +107,15 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
     candidates = [model]
+    bare = _strip_version_suffix(model)
+    if bare != model:
+        candidates.append(f"{_VERTEX_PREFIX}{model}")
     candidates.extend(f"{prefix}{model}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
-    alias = MODEL_ALIASES.get(model)
+    if bare != model:
+        candidates.append(bare)
+        candidates.extend(f"{prefix}{bare}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
+        candidates.append(f"{_VERTEX_PREFIX}{bare}")
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:
         candidates.append(alias)
     return tuple(dict.fromkeys(candidates))
