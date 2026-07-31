@@ -1187,7 +1187,19 @@ class LiteLLMBackend(Backend):
 
             delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
-                delta_usage["input_tokens"] = final_input_tokens
+                # LiteLLM's prompt_tokens is the *total* prompt size, inclusive
+                # of the cache-read and cache-write tokens (Bedrock reports raw
+                # inputTokens and LiteLLM's AmazonConverseConfig._transform_usage
+                # adds cacheReadInputTokens + cacheWriteInputTokens onto it).
+                # Anthropic's input_tokens must exclude both, since the cache
+                # fields below report them separately and clients treat the three
+                # buckets as disjoint. Without the subtraction a cached streaming
+                # turn double-counts the cached prefix in input_tokens at the full
+                # input rate. Mirrors the non-streaming path in
+                # _anthropic_usage_from_litellm (#1345 / #1848).
+                delta_usage["input_tokens"] = max(
+                    final_input_tokens - final_cache_read_tokens - final_cache_write_tokens, 0
+                )
                 if final_cache_read_tokens:
                     delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
                 if final_cache_write_tokens:

@@ -169,8 +169,12 @@ class TestStreamingCacheStatsCompletion:
             patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
             patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
         ):
+            # LiteLLM's prompt_tokens is inclusive of the cache tokens, so this
+            # 1600-token prompt is 100 uncached + 1200 cache-read + 300
+            # cache-write. Anthropic's input_tokens must report only the 100
+            # uncached tokens; the cache fields carry the rest.
             mock_acomp.return_value = self._mock_stream_with_final_usage(
-                cache_read=1200, cache_write=300, prompt_tokens=1500
+                cache_read=1200, cache_write=300, prompt_tokens=1600
             )()
             backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
 
@@ -191,9 +195,51 @@ class TestStreamingCacheStatsCompletion:
             message_deltas = [e for e in events if e.event_type == "message_delta"]
             assert len(message_deltas) == 1
             final_usage = message_deltas[0].data["usage"]
-            assert final_usage["input_tokens"] == 1500
+            assert final_usage["input_tokens"] == 100
             assert final_usage["cache_read_input_tokens"] == 1200
             assert final_usage["cache_creation_input_tokens"] == 300
+
+    @pytest.mark.asyncio
+    async def test_terminal_message_delta_input_tokens_excludes_cache_tokens(self):
+        """input_tokens must be disjoint from the cache buckets (#1345/#1848).
+
+        LiteLLM/Bedrock reports prompt_tokens inclusive of cache-read and
+        cache-write tokens, but Anthropic's three input buckets are disjoint:
+        a client sums input_tokens + cache_read_input_tokens +
+        cache_creation_input_tokens to get the total prompt, and bills each at
+        a different rate (cache-read 0.1x, cache-write 1.25x). Emitting the
+        inclusive prompt_tokens as input_tokens double-counts the whole cached
+        prefix at the full input rate on every cached streaming turn. The
+        non-streaming path already subtracts; the streaming path must match.
+        """
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_stream_with_final_usage(
+                cache_read=4000, cache_write=500, prompt_tokens=5000
+            )()
+            backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+
+            events = [
+                e
+                async for e in backend.stream_message(
+                    {"model": "test", "messages": [{"role": "user", "content": "hi"}]}, {}
+                )
+            ]
+
+            final_usage = next(e.data["usage"] for e in events if e.event_type == "message_delta")
+            # 5000 inclusive - 4000 read - 500 write = 500 genuinely-uncached.
+            assert final_usage["input_tokens"] == 500
+            assert final_usage["cache_read_input_tokens"] == 4000
+            assert final_usage["cache_creation_input_tokens"] == 500
+            # The disjoint-bucket invariant: the three sum back to prompt_tokens.
+            assert (
+                final_usage["input_tokens"]
+                + final_usage["cache_read_input_tokens"]
+                + final_usage["cache_creation_input_tokens"]
+                == 5000
+            )
 
     @pytest.mark.asyncio
     async def test_no_extra_message_start_when_usage_never_reported(self):
