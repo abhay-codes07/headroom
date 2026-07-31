@@ -118,7 +118,11 @@ class TestStreamingCacheStatsCompletion:
     """stream_message must request usage and re-surface real cache stats."""
 
     def _mock_stream_with_final_usage(
-        self, cache_read: int = 0, cache_write: int = 0, prompt_tokens: int = 0
+        self,
+        cache_read: int = 0,
+        cache_write: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 50,
     ):
         async def mock_stream():
             chunk1 = MagicMock()
@@ -136,6 +140,7 @@ class TestStreamingCacheStatsCompletion:
             ]
             chunk2.usage = MagicMock(
                 prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_write,
             )
@@ -198,6 +203,8 @@ class TestStreamingCacheStatsCompletion:
             assert final_usage["input_tokens"] == 100
             assert final_usage["cache_read_input_tokens"] == 1200
             assert final_usage["cache_creation_input_tokens"] == 300
+            # Real completion_tokens from the usage chunk, not the 1 content delta.
+            assert final_usage["output_tokens"] == 50
 
     @pytest.mark.asyncio
     async def test_terminal_message_delta_input_tokens_excludes_cache_tokens(self):
@@ -240,6 +247,70 @@ class TestStreamingCacheStatsCompletion:
                 + final_usage["cache_creation_input_tokens"]
                 == 5000
             )
+
+    @pytest.mark.asyncio
+    async def test_output_tokens_uses_real_completion_tokens_not_delta_count(self):
+        """output_tokens must be the provider's completion_tokens, not the SSE
+        delta count.
+
+        The streaming loop increments output_tokens once per
+        content_block_delta, which is a chunk count and undercounts the true
+        token total several-fold. When the trailing usage chunk carries a real
+        completion_tokens (stream_options.include_usage), report that instead,
+        matching the non-streaming path. Here the stream emits a single content
+        delta but the usage chunk reports 137 output tokens.
+        """
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_stream_with_final_usage(
+                prompt_tokens=200, completion_tokens=137
+            )()
+            backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+
+            events = [
+                e
+                async for e in backend.stream_message(
+                    {"model": "test", "messages": [{"role": "user", "content": "hi"}]}, {}
+                )
+            ]
+
+            final_usage = next(e.data["usage"] for e in events if e.event_type == "message_delta")
+            # One content delta streamed, but the real count is 137.
+            assert final_usage["output_tokens"] == 137
+
+    @pytest.mark.asyncio
+    async def test_output_tokens_falls_back_to_delta_count_without_usage_chunk(self):
+        """When no usage chunk arrives, output_tokens falls back to the delta
+        count so a value is still reported."""
+
+        async def mock_stream():
+            for text in ("a", "b", "c"):
+                chunk = MagicMock()
+                chunk.usage = None
+                chunk.choices = [
+                    MagicMock(delta=MagicMock(content=text, tool_calls=None), finish_reason=None)
+                ]
+                yield chunk
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_stream()
+            backend = LiteLLMBackend(provider="openrouter")
+
+            events = [
+                e
+                async for e in backend.stream_message(
+                    {"model": "test", "messages": [{"role": "user", "content": "hi"}]}, {}
+                )
+            ]
+
+            final_usage = next(e.data["usage"] for e in events if e.event_type == "message_delta")
+            # Three content deltas, no usage chunk -> fall back to the count of 3.
+            assert final_usage["output_tokens"] == 3
 
     @pytest.mark.asyncio
     async def test_no_extra_message_start_when_usage_never_reported(self):
