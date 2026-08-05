@@ -6,8 +6,8 @@ from headroom.onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     cpu_arena_enabled,
     create_cpu_session_options,
-    onnx_thread_spinning_enabled,
     hf_entry_known_absent,
+    onnx_thread_spinning_enabled,
 )
 
 
