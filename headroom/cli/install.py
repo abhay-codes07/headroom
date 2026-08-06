@@ -36,6 +36,7 @@ from headroom.install.runtime import (
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    list_manifests,
     load_manifest,
     save_manifest,
 )
@@ -70,9 +71,35 @@ def _require_manifest(profile: str) -> DeploymentManifest:
         manifest = load_manifest(profile)
     except ManifestError as e:
         raise click.ClickException(str(e)) from None
-    if manifest is None:
-        raise click.ClickException(f"No deployment profile named '{profile}' is installed.")
-    return manifest
+    if manifest is not None:
+        return manifest
+
+    # The requested profile isn't installed. `headroom init` installs under a
+    # non-"default" profile name (e.g. init-user), while every lifecycle command
+    # defaults --profile to "default" -- so on an init'd machine the documented
+    # bare commands (`headroom install status`, etc.) would all dead-end (#2811).
+    # Resolve the real target instead of failing with a name the user never
+    # chose: an explicit HEADROOM_DEPLOYMENT_PROFILE (which the runtime exports)
+    # wins; otherwise, when --profile was left at its "default" default and
+    # exactly one deployment is installed, use that one.
+    installed = list_manifests()
+    env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
+    if env_profile and env_profile != profile:
+        try:
+            resolved = load_manifest(env_profile)
+        except ManifestError:
+            resolved = None
+        if resolved is not None:
+            return resolved
+    if profile == "default" and len(installed) == 1:
+        return installed[0]
+
+    if installed:
+        names = ", ".join(sorted(m.profile for m in installed))
+        hint = f" Installed: {names}. Select one with --profile <name>."
+    else:
+        hint = " No deployments are installed; run `headroom init` or `headroom install apply`."
+    raise click.ClickException(f"No deployment profile named '{profile}' is installed.{hint}")
 
 
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:

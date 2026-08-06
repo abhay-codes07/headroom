@@ -1,9 +1,55 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import click
+import pytest
 from click.testing import CliRunner
 
+from headroom.cli import install as inst
 from headroom.cli.main import main
+
+
+def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
+    """On an init'd machine (one profile, e.g. init-user), a bare lifecycle
+    command whose --profile defaults to 'default' resolves to the single
+    installed deployment instead of dead-ending (#2811)."""
+    only = SimpleNamespace(profile="init-user")
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [only])
+
+    assert inst._require_manifest("default") is only
+
+
+def test_require_manifest_honors_env_profile(monkeypatch):
+    """An explicit HEADROOM_DEPLOYMENT_PROFILE (exported by the runtime) selects
+    the target even when the requested profile is not installed."""
+    target = SimpleNamespace(profile="init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(
+        inst, "load_manifest", lambda profile: target if profile == "init-user" else None
+    )
+    monkeypatch.setattr(inst, "list_manifests", lambda: [target])
+
+    assert inst._require_manifest("default") is target
+
+
+def test_require_manifest_lists_installed_profiles_when_ambiguous(monkeypatch):
+    """With several installed profiles and no signal, the error names them and
+    points at --profile instead of dead-ending on 'default'."""
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(
+        inst,
+        "list_manifests",
+        lambda: [SimpleNamespace(profile="init-user"), SimpleNamespace(profile="ci")],
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._require_manifest("default")
+    msg = str(exc.value)
+    assert "ci" in msg and "init-user" in msg and "--profile" in msg
 
 
 def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
