@@ -52,6 +52,55 @@ def test_require_manifest_lists_installed_profiles_when_ambiguous(monkeypatch):
     assert "ci" in msg and "init-user" in msg and "--profile" in msg
 
 
+def _status_manifest(profile: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        profile=profile,
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="none",
+        scope="user",
+        port=8787,
+        health_url="http://127.0.0.1:8787/readyz",
+        backend="anthropic",
+    )
+
+
+def test_install_status_explicit_missing_profile_is_not_redirected_to_env(monkeypatch):
+    """An explicit --profile must be honored or rejected verbatim, never
+    redirected to HEADROOM_DEPLOYMENT_PROFILE or a lone installed deployment: a
+    typo must fail even when the env profile exists (#2832 review). Only a
+    CliRunner invocation exercises the default-vs-explicit distinction."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status", "--profile", "typo"])
+
+    assert res.exit_code != 0
+    assert "typo" in res.output
+    # The error names the installed profile, but the command never operated on it.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
+def test_install_status_omitted_profile_resolves_env_deployment(monkeypatch):
+    """With --profile omitted (Click default), HEADROOM_DEPLOYMENT_PROFILE selects
+    the target so the documented bare command works on an init'd machine."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+    monkeypatch.setattr(inst, "probe_json", lambda url: None)
+    monkeypatch.setattr(inst, "runtime_status", lambda m: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code == 0, res.output
+    assert "Profile:    init-user" in res.output
+
+
 def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []

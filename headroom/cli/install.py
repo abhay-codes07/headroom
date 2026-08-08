@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import click
+from click.core import ParameterSource
 
 from headroom._subprocess import run
 from headroom.install.health import probe_json, probe_ready
@@ -66,6 +67,22 @@ def install() -> None:
     """Install and manage persistent Headroom deployments."""
 
 
+def _profile_selection_was_explicit() -> bool:
+    """True when the current command received an explicit ``--profile``.
+
+    An explicit selection must be honored verbatim or rejected, never redirected
+    to ``HEADROOM_DEPLOYMENT_PROFILE`` or a lone installed deployment: silently
+    operating ``stop``/``restart``/``remove`` on a different profile than the one
+    the user typed is dangerous. Only a defaulted (omitted) ``--profile`` is
+    eligible for the recovery fallback. Outside a Click command context (direct
+    calls / unit tests) there is no explicit selection to protect.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    return bool(ctx.get_parameter_source("profile") == ParameterSource.COMMANDLINE)
+
+
 def _require_manifest(profile: str) -> DeploymentManifest:
     try:
         manifest = load_manifest(profile)
@@ -78,21 +95,24 @@ def _require_manifest(profile: str) -> DeploymentManifest:
     # non-"default" profile name (e.g. init-user), while every lifecycle command
     # defaults --profile to "default" -- so on an init'd machine the documented
     # bare commands (`headroom install status`, etc.) would all dead-end (#2811).
-    # Resolve the real target instead of failing with a name the user never
-    # chose: an explicit HEADROOM_DEPLOYMENT_PROFILE (which the runtime exports)
-    # wins; otherwise, when --profile was left at its "default" default and
-    # exactly one deployment is installed, use that one.
+    # When --profile was left at its default, resolve the real target instead of
+    # failing with a name the user never chose: an explicit
+    # HEADROOM_DEPLOYMENT_PROFILE (which the runtime exports) wins; otherwise,
+    # when exactly one deployment is installed, use that one. An EXPLICIT
+    # --profile is never redirected -- it is honored or rejected verbatim, so a
+    # typo does not silently act on the env/lone profile.
     installed = list_manifests()
-    env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
-    if env_profile and env_profile != profile:
-        try:
-            resolved = load_manifest(env_profile)
-        except ManifestError:
-            resolved = None
-        if resolved is not None:
-            return resolved
-    if profile == "default" and len(installed) == 1:
-        return installed[0]
+    if not _profile_selection_was_explicit():
+        env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
+        if env_profile and env_profile != profile:
+            try:
+                resolved = load_manifest(env_profile)
+            except ManifestError:
+                resolved = None
+            if resolved is not None:
+                return resolved
+        if len(installed) == 1:
+            return installed[0]
 
     if installed:
         names = ", ".join(sorted(m.profile for m in installed))
