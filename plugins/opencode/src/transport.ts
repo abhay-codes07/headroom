@@ -9,6 +9,12 @@ const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
 const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+// Per-project savings attribution: the server (`project_policy.classify_project`)
+// attributes routed traffic via this header or a `/p/<name>` path prefix. Without
+// it every OpenCode request is unattributed and the dashboard shows 0 projects
+// (#2847). The child-process `HEADROOM_PROJECT` env var only reaches spawned
+// subprocesses, not the proxied HTTP requests, so it has to ride on the header too.
+const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
@@ -26,12 +32,14 @@ type ChildFork = typeof childProcess.fork;
 interface InstallOptions {
   proxyUrl: string;
   debug?: boolean;
+  project?: string;
 }
 
 interface TransportState {
   refs: number;
   proxyUrl: string;
   debug: boolean;
+  project?: string;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
   originalHttpGet: HttpGet;
@@ -240,6 +248,10 @@ function mergeFetchHeaders(
   }
   if (upstream) {
     headers.set(BASE_URL_HEADER, upstream.origin);
+    const project = getState()?.project;
+    if (project) {
+      headers.set(PROJECT_HEADER, project);
+    }
     headers.delete("host");
   }
   if (originalPath) {
@@ -317,6 +329,10 @@ function headersForNodeRequest(
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
+  const project = getState()?.project;
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
@@ -421,6 +437,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.debug = Boolean(options.debug);
+    existing.project = options.project ?? existing.project;
     installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
   }
@@ -429,6 +446,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
     refs: 1,
     proxyUrl: options.proxyUrl,
     debug: Boolean(options.debug),
+    project: options.project,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,

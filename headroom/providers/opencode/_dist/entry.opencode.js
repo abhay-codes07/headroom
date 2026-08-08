@@ -12487,6 +12487,7 @@ var childProcess = nodeRequire("node:child_process");
 var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+var PROJECT_HEADER = "x-headroom-project";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
@@ -12642,6 +12643,10 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
   }
   if (upstream) {
     headers.set(BASE_URL_HEADER, upstream.origin);
+    const project = getState()?.project;
+    if (project) {
+      headers.set(PROJECT_HEADER, project);
+    }
     headers.delete("host");
   }
   if (originalPath) {
@@ -12706,6 +12711,10 @@ function urlFromRequestOptions(options) {
 function headersForNodeRequest(options, upstream, originalPath) {
   const headers = new Headers(options.headers);
   headers.set(BASE_URL_HEADER, upstream.origin);
+  const project = getState()?.project;
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
@@ -12795,6 +12804,7 @@ function installHeadroomTransport(options) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.debug = Boolean(options.debug);
+    existing.project = options.project ?? existing.project;
     installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
   }
@@ -12802,6 +12812,7 @@ function installHeadroomTransport(options) {
     refs: 1,
     proxyUrl: options.proxyUrl,
     debug: Boolean(options.debug),
+    project: options.project,
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
     originalHttpGet: http.get,
@@ -12868,13 +12879,18 @@ function resolveProxyUrl(options) {
     options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
   );
 }
+function resolveProject(options, input) {
+  return options.project ?? input.project?.id ?? input.directory;
+}
 var HeadroomPlugin = async (input, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project = resolveProject(pluginOptions, input);
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
-    debug: pluginOptions.debug
+    debug: pluginOptions.debug,
+    project
   });
   return {
     dispose: async () => {
@@ -12894,7 +12910,9 @@ var HeadroomPlugin = async (input, options = {}) => {
     "shell.env": async (_input, output) => {
       output.env.HEADROOM_ACTIVE = "1";
       output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT = pluginOptions.project ?? input.project.id ?? input.directory;
+      if (project) {
+        output.env.HEADROOM_PROJECT = project;
+      }
       if (pluginOptions.backend) {
         output.env.HEADROOM_BACKEND = pluginOptions.backend;
       }

@@ -25,13 +25,29 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
   );
 }
 
+function resolveProject(
+  options: HeadroomOpenCodePluginOptions,
+  input: { project?: unknown; directory?: string },
+): string | undefined {
+  return (
+    options.project ??
+    (input.project as { id?: string } | undefined)?.id ??
+    input.directory
+  );
+}
+
 export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  // Resolve the project once so the transport header and the spawned-subprocess
+  // env var agree, and per-project savings attribution works for the proxied
+  // HTTP requests too, not just child processes (#2847).
+  const project = resolveProject(pluginOptions, input);
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     debug: pluginOptions.debug,
+    project,
   });
 
   return {
@@ -54,10 +70,9 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     "shell.env": async (_input, output) => {
       output.env.HEADROOM_ACTIVE = "1";
       output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT =
-        pluginOptions.project ??
-        (input.project as { id?: string }).id ??
-        input.directory;
+      if (project) {
+        output.env.HEADROOM_PROJECT = project;
+      }
       if (pluginOptions.backend) {
         output.env.HEADROOM_BACKEND = pluginOptions.backend;
       }

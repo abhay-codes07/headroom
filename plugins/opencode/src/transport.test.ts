@@ -193,6 +193,58 @@ describe("Headroom OpenCode transport", () => {
     await proxy.close();
   });
 
+  it("sets x-headroom-project on routed fetch when a project is configured (#2847)", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project: "acme-web" });
+
+    await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST" });
+
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("x-headroom-project")).toBe("acme-web");
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("omits x-headroom-project when no project is configured", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    await fetch("https://api.deepseek.com/v1/chat/completions", { method: "POST" });
+
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("x-headroom-project")).toBeNull();
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sets x-headroom-project on routed Node https.request when a project is configured (#2847)", async () => {
+    const proxy = await proxyServer();
+    installHeadroomTransport({ proxyUrl: proxy.url, project: "acme-web" });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        "https://api.anthropic.com/v1/messages",
+        { method: "POST" },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+
+    expect(proxy.seen[0].headers["x-headroom-project"]).toBe("acme-web");
+
+    await proxy.close();
+  });
+
   it("normalizes Node HTTP(S) requests for /chat/completions and /responses", async () => {
     const proxy = await proxyServer("");
     installHeadroomTransport({ proxyUrl: proxy.url });
