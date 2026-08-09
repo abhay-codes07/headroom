@@ -84,6 +84,24 @@ def test_install_status_explicit_missing_profile_is_not_redirected_to_env(monkey
     assert "Status:" not in res.output
 
 
+def test_install_status_stale_env_profile_is_not_redirected_to_lone_manifest(monkeypatch):
+    """A non-empty HEADROOM_DEPLOYMENT_PROFILE is an explicit selection: if it
+    names a missing/stale profile the command must fail naming that profile, never
+    silently redirect to a different lone installed deployment (#2832 review)."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "missing")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code != 0
+    assert "missing" in res.output
+    # Never operated on the lone init-user deployment.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
 def test_install_status_omitted_profile_resolves_env_deployment(monkeypatch):
     """With --profile omitted (Click default), HEADROOM_DEPLOYMENT_PROFILE selects
     the target so the documented bare command works on an init'd machine."""

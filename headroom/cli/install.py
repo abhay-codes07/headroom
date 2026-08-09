@@ -83,6 +83,21 @@ def _profile_selection_was_explicit() -> bool:
     return bool(ctx.get_parameter_source("profile") == ParameterSource.COMMANDLINE)
 
 
+def _missing_profile_error(
+    name: str,
+    installed: list[DeploymentManifest],
+    *,
+    source: str | None = None,
+) -> click.ClickException:
+    if installed:
+        names = ", ".join(sorted(m.profile for m in installed))
+        hint = f" Installed: {names}. Select one with --profile <name>."
+    else:
+        hint = " No deployments are installed; run `headroom init` or `headroom install apply`."
+    origin = f" (from {source})" if source else ""
+    return click.ClickException(f"No deployment profile named '{name}'{origin} is installed.{hint}")
+
+
 def _require_manifest(profile: str) -> DeploymentManifest:
     try:
         manifest = load_manifest(profile)
@@ -95,31 +110,33 @@ def _require_manifest(profile: str) -> DeploymentManifest:
     # non-"default" profile name (e.g. init-user), while every lifecycle command
     # defaults --profile to "default" -- so on an init'd machine the documented
     # bare commands (`headroom install status`, etc.) would all dead-end (#2811).
-    # When --profile was left at its default, resolve the real target instead of
-    # failing with a name the user never chose: an explicit
-    # HEADROOM_DEPLOYMENT_PROFILE (which the runtime exports) wins; otherwise,
-    # when exactly one deployment is installed, use that one. An EXPLICIT
-    # --profile is never redirected -- it is honored or rejected verbatim, so a
-    # typo does not silently act on the env/lone profile.
     installed = list_manifests()
-    if not _profile_selection_was_explicit():
-        env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
-        if env_profile and env_profile != profile:
+
+    # An EXPLICIT --profile is honored or rejected verbatim, never redirected: a
+    # typo must not silently act on the env/lone profile (#2832 review).
+    if _profile_selection_was_explicit():
+        raise _missing_profile_error(profile, installed)
+
+    # --profile was defaulted. A non-empty HEADROOM_DEPLOYMENT_PROFILE (which the
+    # runtime exports) is itself an explicit selection: honor it when installed,
+    # otherwise fail naming it. It must never fall through to the lone-manifest
+    # fallback and silently operate on a different deployment (#2832 review).
+    env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
+    if env_profile:
+        if env_profile != profile:
             try:
                 resolved = load_manifest(env_profile)
             except ManifestError:
                 resolved = None
             if resolved is not None:
                 return resolved
-        if len(installed) == 1:
-            return installed[0]
+        raise _missing_profile_error(env_profile, installed, source="HEADROOM_DEPLOYMENT_PROFILE")
 
-    if installed:
-        names = ", ".join(sorted(m.profile for m in installed))
-        hint = f" Installed: {names}. Select one with --profile <name>."
-    else:
-        hint = " No deployments are installed; run `headroom init` or `headroom install apply`."
-    raise click.ClickException(f"No deployment profile named '{profile}' is installed.{hint}")
+    # Neither CLI nor environment named a profile. A single installed deployment
+    # is unambiguous, so use it; otherwise report what is available.
+    if len(installed) == 1:
+        return installed[0]
+    raise _missing_profile_error(profile, installed)
 
 
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
