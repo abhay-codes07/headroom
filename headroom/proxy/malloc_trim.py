@@ -26,6 +26,12 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# Interval bounds for the periodic trim task. A non-positive interval would make
+# ``asyncio.sleep`` return immediately and spin a continuous collect/trim loop,
+# so anything below the minimum falls back to the default.
+_DEFAULT_TRIM_INTERVAL_SECONDS = 60
+_MIN_TRIM_INTERVAL_SECONDS = 1
+
 # Lazily resolved (platform_tag, foreign_function | None). ``None`` function
 # means the platform has no supported trim call and trim() is a no-op.
 _relief: tuple[str, object | None] | None = None
@@ -72,19 +78,40 @@ def trim() -> int:
 async def trim_periodically(interval_seconds: int = 60) -> None:
     """Background task that periodically returns allocator free pages to the OS.
 
-    Runs in every worker process (allocator state is per-process). The
-    ``gc.collect()`` inside ``trim()`` holds the GIL for the duration of the
-    collection, so the pause lands between requests just as any other
-    collection would.
+    Runs in every worker process (allocator state is per-process). The blocking
+    trim (``gc.collect()`` plus ``malloc_zone_pressure_relief``/``malloc_trim``,
+    which can be slow on a large heap) runs via ``asyncio.to_thread`` so it never
+    blocks the event loop, and the task exits immediately on platforms with no
+    supported trim call, so it is a true no-op there.
 
     Args:
-        interval_seconds: How often to trim (default: 60 seconds).
+        interval_seconds: How often to trim (default: 60 seconds). A value below
+            ``_MIN_TRIM_INTERVAL_SECONDS`` (which would busy-loop) falls back to
+            the default.
     """
+    _, fn = _resolve()
+    if fn is None:
+        # No supported allocator-trim call on this platform (Windows, musl, ...);
+        # do not spin a wakeup task that can only ever no-op.
+        logger.debug("MallocTrim: no supported trim on %s; task disabled", sys.platform)
+        return
+
+    if interval_seconds < _MIN_TRIM_INTERVAL_SECONDS:
+        logger.warning(
+            "MallocTrim: interval %ss is below the %ds minimum; using default %ds",
+            interval_seconds,
+            _MIN_TRIM_INTERVAL_SECONDS,
+            _DEFAULT_TRIM_INTERVAL_SECONDS,
+        )
+        interval_seconds = _DEFAULT_TRIM_INTERVAL_SECONDS
+
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             start = time.perf_counter()
-            freed = trim()
+            # Off the event-loop thread: the gc + C-level purge can pause for a
+            # while on a large heap, and that pause must not stall proxy traffic.
+            freed = await asyncio.to_thread(trim)
             elapsed_ms = (time.perf_counter() - start) * 1000
             log = logger.info if freed >= (16 << 20) else logger.debug
             log(

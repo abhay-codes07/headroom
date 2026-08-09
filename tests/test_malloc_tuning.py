@@ -120,6 +120,7 @@ def test_trim_is_noop_on_unsupported_platform(monkeypatch):
 
 
 def test_trim_periodically_trims_each_interval(monkeypatch):
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", object()))
     trims: list[int] = []
     monkeypatch.setattr(malloc_trim, "trim", lambda: trims.append(1) or 0)
 
@@ -132,6 +133,132 @@ def test_trim_periodically_trims_each_interval(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(malloc_trim.trim_periodically(interval_seconds=1))
     assert len(trims) == 2
+
+
+def test_trim_periodically_is_disabled_on_unsupported_platform(monkeypatch):
+    # No supported trim call: the task must return at once, never scheduling a
+    # wakeup (so it is a true no-op on Windows/musl, not a 60s spinner).
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("unsupported", None))
+    trims: list[int] = []
+    monkeypatch.setattr(malloc_trim, "trim", lambda: trims.append(1) or 0)
+
+    async def _no_sleep(_seconds):
+        raise AssertionError("unsupported platform must not schedule a trim wakeup")
+
+    monkeypatch.setattr(malloc_trim.asyncio, "sleep", _no_sleep)
+    asyncio.run(malloc_trim.trim_periodically(interval_seconds=60))  # returns, no raise
+    assert trims == []
+
+
+@pytest.mark.parametrize("bad_interval", [0, -5])
+def test_trim_periodically_rejects_non_positive_interval(monkeypatch, bad_interval):
+    # A non-positive interval would make asyncio.sleep return immediately and
+    # spin a continuous collect/trim loop; it must fall back to the default.
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", object()))
+    monkeypatch.setattr(malloc_trim, "trim", lambda: 0)
+    slept: list[float] = []
+
+    async def capture_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError  # stop after the first sleep
+
+    monkeypatch.setattr(malloc_trim.asyncio, "sleep", capture_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(malloc_trim.trim_periodically(interval_seconds=bad_interval))
+    assert slept == [malloc_trim._DEFAULT_TRIM_INTERVAL_SECONDS]
+
+
+def test_trim_runs_off_the_event_loop_thread(monkeypatch):
+    # The blocking trim must run in a worker thread (via asyncio.to_thread), not
+    # on the event loop, so a slow trim cannot stall other async work.
+    import threading
+
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", object()))
+    seen: dict[str, int] = {}
+
+    def record():
+        seen["thread"] = threading.get_ident()
+        return 0
+
+    monkeypatch.setattr(malloc_trim, "trim", record)
+    calls = {"n": 0}
+
+    async def sleeper(_seconds):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # first sleep returns; after the trim, stop
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(malloc_trim.asyncio, "sleep", sleeper)
+
+    async def _run() -> int:
+        loop_thread = threading.get_ident()
+        with pytest.raises(asyncio.CancelledError):
+            await malloc_trim.trim_periodically(interval_seconds=60)
+        return loop_thread
+
+    loop_thread = asyncio.run(_run())
+    assert "thread" in seen  # trim actually ran
+    assert seen["thread"] != loop_thread  # ran off the event-loop thread
+
+
+@pytest.mark.asyncio
+async def test_slow_trim_does_not_stop_unrelated_async_work(monkeypatch):
+    # A deliberately slow trim (here it parks a worker thread) must not freeze the
+    # event loop: unrelated coroutines keep making progress while it runs.
+    import threading
+
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", object()))
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_trim() -> int:
+        started.set()
+        release.wait(5.0)  # hold the worker thread until the test lets go
+        return 0
+
+    monkeypatch.setattr(malloc_trim, "trim", slow_trim)
+
+    # Fire the trim's interval immediately (the interval is >= 1s) while leaving
+    # the counter's sub-second sleeps to behave normally.
+    real_sleep = asyncio.sleep
+
+    async def smart_sleep(seconds):
+        if seconds >= 1:
+            return
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(malloc_trim.asyncio, "sleep", smart_sleep)
+
+    ticks = 0
+
+    async def counter() -> None:
+        nonlocal ticks
+        while True:
+            await real_sleep(0.005)
+            ticks += 1
+
+    counter_task = asyncio.create_task(counter())
+    trim_task = asyncio.create_task(malloc_trim.trim_periodically(interval_seconds=60))
+    try:
+        # Wait for the trim to actually start blocking a worker thread.
+        for _ in range(400):
+            if started.is_set():
+                break
+            await real_sleep(0.005)
+        assert started.is_set(), "trim never started"
+
+        # The trim is now parked off-loop. The event loop must keep ticking.
+        ticks_before = ticks
+        await real_sleep(0.2)
+        ticks_during_trim = ticks - ticks_before
+    finally:
+        release.set()
+        counter_task.cancel()
+        trim_task.cancel()
+
+    # On-loop blocking would freeze the counter (~0 ticks); off-thread it keeps
+    # ticking (~40 in 0.2s). Generous floor for scheduler jitter.
+    assert ticks_during_trim >= 10
 
 
 # --------------------------------------------------------------------------- #
