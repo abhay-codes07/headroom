@@ -1710,8 +1710,10 @@ def _index_serena_project(*, verbose: bool = False) -> None:
         result = run(
             [
                 "uvx",
+                # PyPI (prebuilt wheels), not the git source that fails to build
+                # under proot-based filesystems (#2871).
                 "--from",
-                "git+https://github.com/oraios/serena",
+                "serena-agent",
                 "serena",
                 "project",
                 "index",
