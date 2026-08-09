@@ -2791,9 +2791,28 @@ class AnthropicHandlerMixin:
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
-                        uncached_input_tokens = max(
-                            0, attempted_input_tokens - cr_tokens - cw_tokens
-                        )
+                        # Prefer the backend's Anthropic-shaped ``input_tokens``,
+                        # which is already the uncached count (prompt tokens minus
+                        # cache read/creation; see ``_anthropic_usage_from_litellm``
+                        # / #1345), matching the direct-API path below. Re-deriving
+                        # it as ``attempted_input_tokens - cache`` is wrong whenever
+                        # the backend reports it: ``attempted_input_tokens`` is the
+                        # live-zone tokenizer count kept for the compression-ratio
+                        # denominator, not the full request size, so on any turn
+                        # whose cached prefix is larger than the new turn it
+                        # underflows and ``max(0, ...)`` clamps uncached to 0.
+                        #
+                        # Guard on the backend actually reporting it: a backend that
+                        # omits ``input_tokens`` (or sends null) must not silently
+                        # report uncached=0 — fall back to the live-zone derivation,
+                        # which is never worse than the previous behaviour.
+                        _reported_input_tokens = usage.get("input_tokens")
+                        if _reported_input_tokens is not None:
+                            uncached_input_tokens = int(_reported_input_tokens)
+                        else:
+                            uncached_input_tokens = max(
+                                0, attempted_input_tokens - cr_tokens - cw_tokens
+                            )
 
                         # Update prefix cache tracker for next turn. Mirrors the
                         # direct-Anthropic-API branch below (~line 3011) — without
