@@ -2737,6 +2737,28 @@ class AnthropicHandlerMixin:
                     _ts_stripped,
                 )
 
+            # CCR retrieve history repair (#2814). Run beside the tool-search
+            # repair and after both normal CCR injection and turn hooks, so it
+            # validates against the final outbound tools array. A side-request
+            # that does not declare headroom_retrieve cannot retain historical
+            # tool_use/tool_result references that Anthropic would reject.
+            from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks
+
+            _ccr_repaired, _ccr_neutralized = strip_unsupported_ccr_retrieve_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ccr_neutralized:
+                body["messages"] = _ccr_repaired
+                optimized_messages = _ccr_repaired
+                body_mutation_tracker.mark_mutated("ccr_retrieve_history_repair")
+                transforms_applied.append(f"router:ccr_retrieve_repair:{_ccr_neutralized}blocks")
+                logger.info(
+                    "[%s] CCR: neutralized %d headroom_retrieve history block(s) "
+                    "(tools array does not declare the tool this turn)",
+                    request_id,
+                    _ccr_neutralized,
+                )
+
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
             # can leave original_tokens (handler, line ~1049) and optimized_tokens

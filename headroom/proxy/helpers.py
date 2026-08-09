@@ -3027,6 +3027,126 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
     return (out, removed) if changed else (messages, 0)
 
 
+def _ccr_result_as_text(block: dict[str, Any]) -> str:
+    """Flatten a ``tool_result`` block's content to plain text, preserving what
+    the model already saw. Falls back to a short placeholder when there is no
+    textual content to keep."""
+    content = block.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        joined = "\n".join(part for part in parts if part)
+        if joined.strip():
+            return joined
+    return "[headroom_retrieve result omitted]"
+
+
+def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Neutralize ``headroom_retrieve`` history references the outbound ``tools``
+    array cannot support.
+
+    Claude Code replays one transcript across requests that carry different
+    ``tools`` arrays, and Anthropic validates every history ``tool_use`` against
+    the array of the request at hand. A passthrough side-request (the prompt-type
+    Stop hook evaluator, ``/compact``) that the proxy forwards without declaring
+    ``headroom_retrieve`` then 400s on a historical ``tool_use`` that names it --
+    the CCR sibling of the tool-search history repair (#2814 / #2807). This is
+    belt-and-braces with the injection-side fixes: they keep the tool available
+    where it belongs; this makes the 400 structurally impossible where it cannot.
+
+    When the request does NOT declare ``headroom_retrieve``, replace each
+    ``headroom_retrieve`` ``tool_use`` block and its paired ``tool_result`` with a
+    text block, so no dangling reference survives. Neutralize rather than drop:
+    CCR's ``tool_use`` (an assistant turn) and its ``tool_result`` (the next user
+    turn) live in DIFFERENT messages, so removing a message could leave two
+    same-role messages adjacent and break Anthropic's user/assistant alternation.
+    Replacing blocks in place keeps every message and role intact, and preserves
+    the retrieved text the model already saw.
+
+    Returns ``(messages, blocks_neutralized)``, and the ORIGINAL ``messages``
+    object when nothing changed -- callers rely on identity to skip the write-back.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # The tool is declared this turn (e.g. the main loop, or sticky re-injection),
+    # so its history references resolve. Nothing to repair.
+    if CCR_TOOL_NAME in available:
+        return messages, 0
+
+    # First pass: collect the ids of headroom_retrieve tool_use blocks so their
+    # paired tool_result blocks (in a later user turn) can be matched.
+    retrieve_ids: set[str] = set()
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == CCR_TOOL_NAME
+            ):
+                use_id = block.get("id")
+                if use_id:
+                    retrieve_ids.add(str(use_id))
+
+    if not retrieve_ids:
+        return messages, 0
+
+    out: list[Any] = []
+    neutralized = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        new_content: list[Any] = []
+        touched = False
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use" and block.get("name") == CCR_TOOL_NAME:
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": "[headroom_retrieve call omitted: tool not available this turn]",
+                        }
+                    )
+                    neutralized += 1
+                    touched = True
+                    continue
+                if (
+                    block.get("type") == "tool_result"
+                    and str(block.get("tool_use_id", "")) in retrieve_ids
+                ):
+                    new_content.append({"type": "text", "text": _ccr_result_as_text(block)})
+                    neutralized += 1
+                    touched = True
+                    continue
+            new_content.append(block)
+
+        if touched:
+            changed = True
+            repaired = dict(message)
+            repaired["content"] = new_content
+            out.append(repaired)
+        else:
+            out.append(message)
+
+    return (out, neutralized) if changed else (messages, 0)
+
+
 # ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
