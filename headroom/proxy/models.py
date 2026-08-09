@@ -439,6 +439,14 @@ class ProxyConfig:
     # Env: HEADROOM_PERIODIC_TOIN_STATS=0.
     periodic_toin_stats_enabled: bool = True
 
+    # Periodic allocator trim. Long-lived proxies processing large concurrent
+    # request bodies ratchet RSS through freed-but-retained allocator pages;
+    # this returns them to the OS (malloc_zone_pressure_relief on macOS,
+    # malloc_trim on glibc). Envs: HEADROOM_MALLOC_TRIM=0,
+    # HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = True
+    malloc_trim_interval_seconds: int = 60
+
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
 

@@ -1,0 +1,145 @@
+"""macOS libmalloc tuning: pre-main re-exec gating + periodic allocator trim (#2820)."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+import headroom.cli.proxy as proxy_cli
+from headroom.proxy import malloc_trim
+
+
+class _ExecCalled(Exception):
+    """Sentinel so a fake execv can stop execution the way real execv would."""
+
+
+def _fake_execv(recorder: dict):
+    def _execv(path, argv):  # noqa: ANN001
+        recorder["path"] = path
+        recorder["argv"] = list(argv)
+        raise _ExecCalled
+
+    return _execv
+
+
+@pytest.fixture(autouse=True)
+def _clean_malloc_env(monkeypatch):
+    for var in (
+        "HEADROOM_MALLOC_TUNING",
+        "_HEADROOM_MALLOC_TUNED",
+        "MallocAggressiveMadvise",
+        "MallocLargeCache",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+# --------------------------------------------------------------------------- #
+# _reexec_with_malloc_tuning
+# --------------------------------------------------------------------------- #
+def test_reexec_noop_off_darwin(monkeypatch):
+    monkeypatch.setattr(proxy_cli.sys, "platform", "linux")
+    rec: dict = {}
+    monkeypatch.setattr(proxy_cli.os, "execv", _fake_execv(rec))
+    proxy_cli._reexec_with_malloc_tuning()  # must not raise / exec
+    assert rec == {}
+
+
+def test_reexec_respects_opt_out(monkeypatch):
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setenv("HEADROOM_MALLOC_TUNING", "0")
+    rec: dict = {}
+    monkeypatch.setattr(proxy_cli.os, "execv", _fake_execv(rec))
+    proxy_cli._reexec_with_malloc_tuning()
+    assert rec == {}
+
+
+def test_reexec_guard_prevents_loop(monkeypatch):
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setenv("_HEADROOM_MALLOC_TUNED", "1")
+    rec: dict = {}
+    monkeypatch.setattr(proxy_cli.os, "execv", _fake_execv(rec))
+    proxy_cli._reexec_with_malloc_tuning()
+    assert rec == {}
+
+
+def test_reexec_skips_when_operator_already_set_vars(monkeypatch):
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setenv("MallocAggressiveMadvise", "1")
+    monkeypatch.setenv("MallocLargeCache", "0")
+    rec: dict = {}
+    monkeypatch.setattr(proxy_cli.os, "execv", _fake_execv(rec))
+    proxy_cli._reexec_with_malloc_tuning()
+    # No re-exec (vars present), but the guard is still stamped.
+    assert rec == {}
+    assert proxy_cli.os.environ.get("_HEADROOM_MALLOC_TUNED") == "1"
+
+
+def test_reexec_sets_vars_and_execs_once(monkeypatch):
+    monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(proxy_cli.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(proxy_cli.sys, "argv", ["headroom", "proxy", "--port", "8787"])
+    rec: dict = {}
+    monkeypatch.setattr(proxy_cli.os, "execv", _fake_execv(rec))
+
+    with pytest.raises(_ExecCalled):
+        proxy_cli._reexec_with_malloc_tuning()
+
+    # The tuning knobs and the loop guard are exported to the replacement process.
+    assert proxy_cli.os.environ["MallocAggressiveMadvise"] == "1"
+    assert proxy_cli.os.environ["MallocLargeCache"] == "0"
+    assert proxy_cli.os.environ["_HEADROOM_MALLOC_TUNED"] == "1"
+    # Re-exec normalizes to `python -m headroom.cli <args>`, preserving the PID.
+    assert rec["path"] == "/usr/bin/python3"
+    assert rec["argv"] == ["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"]
+
+
+# --------------------------------------------------------------------------- #
+# malloc_trim.trim / trim_periodically
+# --------------------------------------------------------------------------- #
+def test_trim_calls_platform_fn_after_gc(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(malloc_trim.gc, "collect", lambda: calls.append("gc") or 0)
+
+    def fake_fn(ptr, size):  # noqa: ANN001  (mac signature)
+        calls.append(f"fn({ptr},{size})")
+        return 4096
+
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("darwin", fake_fn))
+    freed = malloc_trim.trim()
+    assert freed == 4096
+    assert calls == ["gc", "fn(None,0)"]
+
+
+def test_trim_is_noop_on_unsupported_platform(monkeypatch):
+    collected: list[str] = []
+    monkeypatch.setattr(malloc_trim.gc, "collect", lambda: collected.append("gc"))
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("unsupported", None))
+    assert malloc_trim.trim() == 0
+    assert collected == []  # no gc.collect when there is nothing to trim
+
+
+def test_trim_periodically_trims_each_interval(monkeypatch):
+    trims: list[int] = []
+    monkeypatch.setattr(malloc_trim, "trim", lambda: trims.append(1) or 0)
+
+    async def fake_sleep(_seconds):
+        if len(trims) >= 2:  # let two ticks run, then break the loop
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(malloc_trim.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(malloc_trim.trim_periodically(interval_seconds=1))
+    assert len(trims) == 2
+
+
+# --------------------------------------------------------------------------- #
+# ProxyConfig wiring
+# --------------------------------------------------------------------------- #
+def test_proxy_config_exposes_malloc_trim_knobs():
+    from headroom.proxy.models import ProxyConfig
+
+    cfg = ProxyConfig()
+    assert cfg.periodic_malloc_trim_enabled is True
+    assert cfg.malloc_trim_interval_seconds == 60
