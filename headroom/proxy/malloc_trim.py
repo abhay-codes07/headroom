@@ -10,16 +10,18 @@ this reaches double-digit GB and starves the host.
 
 Neither runtime returns these pages on its own. macOS exposes
 ``malloc_zone_pressure_relief(NULL, 0)`` to purge every zone's free pages;
-glibc has ``malloc_trim(0)``. ``trim()`` runs a full ``gc.collect()`` first so
-obmalloc can unmap empty arenas and freed CPython blocks reach the allocator
-free lists before the purge.
+glibc has ``malloc_trim(0)``. ``trim()`` calls that entry point directly: it is
+a C call that releases the GIL and reclaims whatever is already on the
+allocator's free lists. It deliberately does not run a Python ``gc.collect()``
+-- a full cyclic collection holds the GIL, and this periodic task runs off the
+event-loop thread precisely so it cannot stall request handling; freeing cyclic
+garbage is left to CPython's own automatic collection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ctypes
-import gc
 import logging
 import sys
 import time
@@ -59,7 +61,15 @@ def _resolve() -> tuple[str, object | None]:
 
 
 def trim() -> int:
-    """Collect garbage and return allocator free pages to the OS.
+    """Return allocator free pages to the OS.
+
+    Calls the platform's allocator pressure-relief entry point
+    (``malloc_zone_pressure_relief`` on macOS, ``malloc_trim`` on glibc). This
+    is a C call that releases the GIL for its duration and reclaims pages
+    already on the allocator's free lists. It deliberately does *not* run a
+    Python ``gc.collect()`` (a full cyclic collection holds the GIL); cyclic
+    garbage is left to CPython's automatic collection, so this off-thread
+    periodic task never holds the GIL for a full-heap traversal.
 
     Returns the number of bytes freed on macOS (glibc's ``malloc_trim``
     reports only success, so 0 is returned there and on unsupported
@@ -68,7 +78,6 @@ def trim() -> int:
     kind, fn = _resolve()
     if fn is None:
         return 0
-    gc.collect()
     if kind == "darwin":
         return int(fn(None, 0))  # type: ignore[operator]
     fn(0)  # type: ignore[operator]
@@ -78,11 +87,14 @@ def trim() -> int:
 async def trim_periodically(interval_seconds: int = 60) -> None:
     """Background task that periodically returns allocator free pages to the OS.
 
-    Runs in every worker process (allocator state is per-process). The blocking
-    trim (``gc.collect()`` plus ``malloc_zone_pressure_relief``/``malloc_trim``,
-    which can be slow on a large heap) runs via ``asyncio.to_thread`` so it never
-    blocks the event loop, and the task exits immediately on platforms with no
-    supported trim call, so it is a true no-op there.
+    Runs in every worker process (allocator state is per-process). The trim is
+    the platform's allocator pressure-relief C call
+    (``malloc_zone_pressure_relief``/``malloc_trim``), dispatched via
+    ``asyncio.to_thread`` so it runs off the event-loop thread. Because it is a
+    C call that releases the GIL and runs no Python ``gc.collect()``, it holds
+    the GIL only as briefly as the to_thread hand-off, so a slow purge on a
+    large heap does not stall request handling. The task exits immediately on
+    platforms with no supported trim call, so it is a true no-op there.
 
     Args:
         interval_seconds: How often to trim (default: 60 seconds). A value below
@@ -109,8 +121,8 @@ async def trim_periodically(interval_seconds: int = 60) -> None:
         await asyncio.sleep(interval_seconds)
         try:
             start = time.perf_counter()
-            # Off the event-loop thread: the gc + C-level purge can pause for a
-            # while on a large heap, and that pause must not stall proxy traffic.
+            # Off the event-loop thread: the C-level purge can pause for a while
+            # on a large heap, and that pause must not stall proxy traffic.
             freed = await asyncio.to_thread(trim)
             elapsed_ms = (time.perf_counter() - start) * 1000
             log = logger.info if freed >= (16 << 20) else logger.debug

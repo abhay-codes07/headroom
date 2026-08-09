@@ -97,26 +97,31 @@ def test_reexec_sets_vars_and_execs_once(monkeypatch):
 # --------------------------------------------------------------------------- #
 # malloc_trim.trim / trim_periodically
 # --------------------------------------------------------------------------- #
-def test_trim_calls_platform_fn_after_gc(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(malloc_trim.gc, "collect", lambda: calls.append("gc") or 0)
-
+def test_trim_calls_platform_fn(monkeypatch):
     def fake_fn(ptr, size):  # noqa: ANN001  (mac signature)
-        calls.append(f"fn({ptr},{size})")
         return 4096
 
     monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("darwin", fake_fn))
-    freed = malloc_trim.trim()
-    assert freed == 4096
-    assert calls == ["gc", "fn(None,0)"]
+    assert malloc_trim.trim() == 4096
+
+
+def test_trim_never_runs_python_gc(monkeypatch):
+    # The periodic trim must NOT trigger a full cyclic collection: gc.collect()
+    # holds the GIL for a whole-heap traversal, which would stall the event loop
+    # even though the C purge itself is dispatched off-thread. Only the
+    # GIL-releasing allocator C call may run.
+    import gc
+
+    ran: list[str] = []
+    monkeypatch.setattr(gc, "collect", lambda *a, **k: ran.append("gc") or 0)
+    monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", lambda _size: 0))
+    malloc_trim.trim()
+    assert ran == []
 
 
 def test_trim_is_noop_on_unsupported_platform(monkeypatch):
-    collected: list[str] = []
-    monkeypatch.setattr(malloc_trim.gc, "collect", lambda: collected.append("gc"))
     monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("unsupported", None))
     assert malloc_trim.trim() == 0
-    assert collected == []  # no gc.collect when there is nothing to trim
 
 
 def test_trim_periodically_trims_each_interval(monkeypatch):
@@ -203,8 +208,11 @@ def test_trim_runs_off_the_event_loop_thread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_slow_trim_does_not_stop_unrelated_async_work(monkeypatch):
-    # A deliberately slow trim (here it parks a worker thread) must not freeze the
-    # event loop: unrelated coroutines keep making progress while it runs.
+    # The periodic trim is dispatched off the event-loop thread via
+    # asyncio.to_thread and runs no Python gc.collect(), so even a slow purge
+    # must not freeze the loop. It is modeled here with a worker-thread park
+    # which, like the real GIL-releasing allocator C call, does not hold the
+    # GIL while it waits: unrelated coroutines keep making progress meanwhile.
     import threading
 
     monkeypatch.setattr(malloc_trim, "_resolve", lambda: ("glibc", object()))
@@ -264,9 +272,17 @@ async def test_slow_trim_does_not_stop_unrelated_async_work(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ProxyConfig wiring
 # --------------------------------------------------------------------------- #
-def test_proxy_config_exposes_malloc_trim_knobs():
-    from headroom.proxy.models import ProxyConfig
+def test_proxy_config_malloc_trim_default_is_darwin_scoped(monkeypatch):
+    # Default-on only on macOS (the platform with the documented RSS ratchet);
+    # elsewhere it is opt-in, so glibc deployments do not silently take on a
+    # once-a-minute allocator purge.
+    from headroom.proxy import models
 
-    cfg = ProxyConfig()
-    assert cfg.periodic_malloc_trim_enabled is True
-    assert cfg.malloc_trim_interval_seconds == 60
+    monkeypatch.setattr(models.sys, "platform", "darwin")
+    assert models.ProxyConfig().periodic_malloc_trim_enabled is True
+
+    monkeypatch.setattr(models.sys, "platform", "linux")
+    assert models.ProxyConfig().periodic_malloc_trim_enabled is False
+
+    # The interval knob is platform-independent.
+    assert models.ProxyConfig().malloc_trim_interval_seconds == 60
