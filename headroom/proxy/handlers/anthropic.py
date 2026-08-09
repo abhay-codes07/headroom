@@ -1875,26 +1875,32 @@ class AnthropicHandlerMixin:
                 if configured_inject_tool:
                     from headroom.proxy.helpers import (
                         apply_session_sticky_ccr_tool,
-                        has_new_ccr_markers,
                         history_references_ccr_tool,
                     )
 
-                    # #1850: markers replayed from the previously-forwarded
-                    # prefix (overlay_cached_prefix) are historical; only
-                    # markers NEW this turn may drive a first-time injection,
-                    # else a replayed marker injects the tool into a session
-                    # that never actually compressed.
-                    has_new_compressed_content = has_new_ccr_markers(
-                        current_detected_hashes=injector.detected_hashes,
-                        previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
-                        provider="anthropic",
-                    )
+                    # Inject whenever the request carries ANY CCR marker, new or
+                    # replayed from the frozen prefix. #1850 narrowed the
+                    # first-time gate to markers created THIS turn to avoid
+                    # arming a session that never compressed, but a replayed
+                    # marker is exactly as unredeemable as a fresh one: the agent
+                    # redeems hashes it was handed turns ago (project instructions
+                    # can even tell it to), and if `headroom_retrieve` is absent
+                    # Anthropic rejects the whole request with 400 "Tool reference
+                    # 'headroom_retrieve' not found in available tools" (#2766). A
+                    # present marker means the session HAS compressed, so this
+                    # cannot start injecting into non-CCR conversations. It is also
+                    # the cache-stable choice: toggling the tool in and out of the
+                    # tools array between turns is what busts the tools cache
+                    # segment, whereas injecting consistently whenever markers
+                    # exist keeps it stable. The `SessionCcrTracker` is
+                    # per-process, so a proxy restart mid-conversation makes live
+                    # sessions look fresh again, which is what re-armed the 400.
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
                         session_id=session_id,
                         request_id=request_id,
                         existing_tools=tools,
-                        has_compressed_content_this_turn=has_new_compressed_content,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
                         history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                     )
                     if ccr_tool_injected:
@@ -2403,7 +2409,33 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
-            # Server-side Tool Search (opt-in HEADROOM_TOOL_SEARCH): defer the
+            from headroom.proxy.helpers import (
+                anthropic_first_party_tool_search_supported,
+                strip_first_party_tool_search_tools_for_third_party_upstream,
+            )
+
+            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
+            _third_party_anthropic_upstream = provider_name == "anthropic" and (
+                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+            )
+            if _third_party_anthropic_upstream:
+                _tools_before_strip = body.get("tools")
+                _tools_after_strip = strip_first_party_tool_search_tools_for_third_party_upstream(
+                    _tools_before_strip,
+                    _anthropic_target_base_url,
+                )
+                if _tools_after_strip is not _tools_before_strip:
+                    body["tools"] = _tools_after_strip
+                    tools = _tools_after_strip
+                    tags["third_party_tool_search_stripped"] = max(
+                        0,
+                        len(_tools_before_strip) - len(_tools_after_strip),
+                    )
+
+            # Server-side Tool Search (on by default; HEADROOM_TOOL_SEARCH=0 opts
+            # out — the `coding` savings profile already seeded it on via
+            # seed_proxy_env_defaults, so default-on here just makes the same
+            # posture hold for entry points that never seeded): defer the
             # non-core tool schemas behind a tool_search tool so Anthropic excludes
             # them from the context window — they stop counting as input tokens until
             # the model searches for one — while every tool stays callable.
@@ -2415,14 +2447,15 @@ class AnthropicHandlerMixin:
             # bytes are excluded from context this turn); the response usage confirms it.
             #
             # FIRST-PARTY ANTHROPIC ONLY: the tool_search_tool_* type + defer_loading
-            # here use the first-party Claude API shape (GA, no beta header). Bedrock
-            # (``anthropic_backend``) and Vertex/gateway providers gate tool search
-            # differently, so scope the injection to provider "anthropic" over the
-            # direct API and leave those paths untouched.
+            # here use the first-party Claude API shape (GA, no beta header). Custom
+            # Anthropic-compatible gateways reject that shape, so third-party routes
+            # strip client-originated tool_search_tool_* entries above and skip
+            # Headroom's own injector here.
             if (
                 provider_name == "anthropic"
+                and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
                 and getattr(self, "anthropic_backend", None) is None
-                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+                and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):
                 from headroom.proxy.helpers import inject_tool_search_deferral
@@ -2447,6 +2480,35 @@ class AnthropicHandlerMixin:
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
                     )
+
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Runs AFTER the injection above so the tool we just added
+            # counts as present: on the main loop nothing is stripped and the prefix
+            # is untouched. Unconditional (not gated on the flag) so transcripts
+            # poisoned before the flag was turned off still recover.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
 
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
@@ -2614,7 +2676,17 @@ class AnthropicHandlerMixin:
                 headers["anthropic-beta"] = _client_beta_value
 
             # Forward request - use Bedrock backend if configured, otherwise direct API
-            if self.anthropic_backend is not None:
+            #
+            # An extension may have published a per-request routing decision on
+            # `request.state.headroom_route` (see proxy/route_advice.py). When
+            # it names a provider we do not already speak, serve this ONE
+            # request from a translating backend for it. Absent, unresolvable,
+            # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
+            # behaviour this line had before.
+            from headroom.proxy.route_advice import resolver_for
+
+            request_backend = resolver_for(self).for_request(request, body=body)
+            if request_backend is not None:
                 # Route through Bedrock backend
                 try:
                     if stream:
@@ -2645,12 +2717,11 @@ class AnthropicHandlerMixin:
                             original_messages=original_client_messages,
                             prefix_tracker=prefix_tracker,
                             optimized_messages=optimized_messages,
+                            backend=request_backend,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
-                            backend_response = await self.anthropic_backend.send_message(
-                                body, headers
-                            )
+                            backend_response = await request_backend.send_message(body, headers)
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -2702,9 +2773,7 @@ class AnthropicHandlerMixin:
                         usage = backend_response.body.get("usage", {})
                         output_tokens = usage.get("output_tokens", 0)
 
-                        _backend_name = (
-                            self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                        )
+                        _backend_name = request_backend.name if request_backend else "anthropic"
                         # Eligible-only denominator for the active
                         # compression ratio: tokens in the live zone we
                         # actually attempted to compress. Frozen prefix
