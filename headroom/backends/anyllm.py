@@ -326,16 +326,22 @@ class AnyLLMBackend(Backend):
 
             stream_response = await self.llm.acompletion(**kwargs)
             output_tokens = 0
-            # Open content blocks lazily as deltas arrive so a response can carry
-            # tool_use blocks (not just text). The previous version pre-opened a
-            # single text block at index 0 and only inspected ``delta.content``,
-            # so a tool call streamed back over any-llm was silently dropped even
-            # though ``tools``/``tool_choice`` are forwarded above — the client
-            # saw an empty turn and the agent loop stalled. Mirrors the
-            # non-streaming ``_to_anthropic_response`` and the LiteLLM streamer.
+            # Stream text immediately in a single text block, but BUFFER tool
+            # calls and emit them as complete blocks at the end. OpenAI streams
+            # parallel tool calls interleaved by index (index 0 and 1 introduced
+            # together, then a fragment for 0, then for 1), while Anthropic
+            # requires each content block to be fully emitted — start, deltas,
+            # stop — before the next opens. Reassembling per index and flushing
+            # complete blocks keeps every delta inside its own block's start/stop
+            # for any interleaving. (The previous version pre-opened one text
+            # block and dropped tool calls entirely; a naive open-on-new-index
+            # instead mis-sequenced parallel calls, emitting a fragment for an
+            # already-stopped block.)
             current_block_index = -1
-            active_block_type: str | None = None  # "text" or "tool_use"
-            tool_block_map: dict[int, int] = {}  # provider tc.index -> SSE block index
+            text_block_open = False
+            # provider tool index -> {"id", "name", "arguments"}, first-seen order
+            tool_calls: dict[int, dict[str, Any]] = {}
+            tool_order: list[int] = []
             stop_reason = "end_turn"
 
             async for chunk in cast(AsyncIterator[Any], stream_response):
@@ -357,61 +363,24 @@ class AnyLLMBackend(Backend):
                 if getattr(delta, "tool_calls", None):
                     for tc in delta.tool_calls:
                         idx = tc.index if getattr(tc, "index", None) is not None else 0
-                        if idx not in tool_block_map:
-                            if active_block_type is not None:
-                                yield StreamEvent(
-                                    event_type="content_block_stop",
-                                    data={
-                                        "type": "content_block_stop",
-                                        "index": current_block_index,
-                                    },
-                                )
-                            current_block_index += 1
-                            tool_block_map[idx] = current_block_index
-                            active_block_type = "tool_use"
-                            tool_id = getattr(tc, "id", None) or f"toolu_{uuid.uuid4().hex[:24]}"
-                            func = getattr(tc, "function", None)
-                            tool_name = func.name if func and func.name else ""
-                            yield StreamEvent(
-                                event_type="content_block_start",
-                                data={
-                                    "type": "content_block_start",
-                                    "index": current_block_index,
-                                    "content_block": {
-                                        "type": "tool_use",
-                                        "id": tool_id,
-                                        "name": tool_name,
-                                        "input": {},
-                                    },
-                                },
-                            )
+                        buf = tool_calls.get(idx)
+                        if buf is None:
+                            buf = {"id": None, "name": "", "arguments": ""}
+                            tool_calls[idx] = buf
+                            tool_order.append(idx)
+                        if getattr(tc, "id", None):
+                            buf["id"] = tc.id
                         func = getattr(tc, "function", None)
-                        if func and func.arguments:
-                            yield StreamEvent(
-                                event_type="content_block_delta",
-                                data={
-                                    "type": "content_block_delta",
-                                    "index": tool_block_map[idx],
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": func.arguments,
-                                    },
-                                },
-                            )
-                            output_tokens += 1
+                        if func is not None:
+                            if getattr(func, "name", None):
+                                buf["name"] = func.name
+                            if getattr(func, "arguments", None):
+                                buf["arguments"] += func.arguments
 
                 elif getattr(delta, "content", None):
-                    if active_block_type != "text":
-                        if active_block_type is not None:
-                            yield StreamEvent(
-                                event_type="content_block_stop",
-                                data={
-                                    "type": "content_block_stop",
-                                    "index": current_block_index,
-                                },
-                            )
+                    if not text_block_open:
                         current_block_index += 1
-                        active_block_type = "text"
+                        text_block_open = True
                         yield StreamEvent(
                             event_type="content_block_start",
                             data={
@@ -430,8 +399,46 @@ class AnyLLMBackend(Backend):
                     )
                     output_tokens += 1
 
-            # Close the last open block, if any content or tool call arrived.
-            if active_block_type is not None:
+            # Close the text block before any tool blocks (Anthropic orders
+            # content blocks sequentially, text then tool_use).
+            if text_block_open:
+                yield StreamEvent(
+                    event_type="content_block_stop",
+                    data={"type": "content_block_stop", "index": current_block_index},
+                )
+
+            # Flush each buffered tool call as a complete, self-contained block:
+            # start, one input_json_delta with the reassembled arguments, stop.
+            for idx in tool_order:
+                buf = tool_calls[idx]
+                current_block_index += 1
+                tool_id = buf["id"] or f"toolu_{uuid.uuid4().hex[:24]}"
+                yield StreamEvent(
+                    event_type="content_block_start",
+                    data={
+                        "type": "content_block_start",
+                        "index": current_block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": buf["name"],
+                            "input": {},
+                        },
+                    },
+                )
+                if buf["arguments"]:
+                    yield StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": buf["arguments"],
+                            },
+                        },
+                    )
+                    output_tokens += 1
                 yield StreamEvent(
                     event_type="content_block_stop",
                     data={"type": "content_block_stop", "index": current_block_index},

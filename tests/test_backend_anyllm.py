@@ -379,10 +379,11 @@ async def test_stream_message_emits_tool_use_blocks(monkeypatch: pytest.MonkeyPa
     ]
     types = [e.event_type for e in events]
 
+    # The tool call is buffered and flushed as one complete block: start, a
+    # single input_json_delta with the reassembled arguments, then stop.
     assert types == [
         "message_start",
         "content_block_start",
-        "content_block_delta",
         "content_block_delta",
         "content_block_stop",
         "message_delta",
@@ -395,12 +396,97 @@ async def test_stream_message_emits_tool_use_blocks(monkeypatch: pytest.MonkeyPa
     assert start.data["content_block"]["name"] == "get_weather"
 
     arg_deltas = [e for e in events if e.event_type == "content_block_delta"]
-    assert [d.data["delta"]["type"] for d in arg_deltas] == ["input_json_delta", "input_json_delta"]
+    assert [d.data["delta"]["type"] for d in arg_deltas] == ["input_json_delta"]
     joined = "".join(d.data["delta"]["partial_json"] for d in arg_deltas)
     assert joined == '{"city":"paris"}'
 
     message_delta = next(e for e in events if e.event_type == "message_delta")
     assert message_delta.data["delta"]["stop_reason"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_stream_message_handles_parallel_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interleaved parallel tool calls must produce valid, disjoint Anthropic blocks.
+
+    OpenAI can introduce two tool indices in one chunk and then stream argument
+    fragments for each across later chunks. Each Anthropic tool_use block must be
+    fully framed (exactly one start and stop, arguments reassembled) with no
+    delta emitted after that block's stop.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = FakeAsyncStream(
+        [
+            # One chunk introduces BOTH tool indices at once.
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="call_0",
+                                    function=SimpleNamespace(name="alpha", arguments='{"a":'),
+                                ),
+                                SimpleNamespace(
+                                    index=1,
+                                    id="call_1",
+                                    function=SimpleNamespace(name="beta", arguments='{"b":'),
+                                ),
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ]
+            ),
+            # Interleaved argument fragments: index 0, then index 1.
+            _tool_call_delta(index=0, arguments="1}"),
+            _tool_call_delta(index=1, arguments="2}"),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(), finish_reason="tool_calls")]
+            ),
+        ]
+    )
+
+    events = [
+        event async for event in backend.stream_message({"model": "claude", "messages": []}, {})
+    ]
+
+    # Each tool block index must have exactly one start and one stop, and no
+    # delta may appear after that index's stop.
+    stopped: set[int] = set()
+    starts: dict[int, int] = {}
+    stops: dict[int, int] = {}
+    args: dict[int, str] = {}
+    for e in events:
+        if e.event_type == "content_block_start":
+            idx = e.data["index"]
+            starts[idx] = starts.get(idx, 0) + 1
+            assert e.data["content_block"]["type"] == "tool_use"
+        elif e.event_type == "content_block_delta":
+            idx = e.data["index"]
+            assert idx not in stopped, f"delta for block {idx} after its stop"
+            args[idx] = args.get(idx, "") + e.data["delta"]["partial_json"]
+        elif e.event_type == "content_block_stop":
+            idx = e.data["index"]
+            stops[idx] = stops.get(idx, 0) + 1
+            stopped.add(idx)
+
+    assert starts == {0: 1, 1: 1}
+    assert stops == {0: 1, 1: 1}
+    assert args == {0: '{"a":1}', 1: '{"b":2}'}
+
+    block0 = next(
+        e for e in events if e.event_type == "content_block_start" and e.data["index"] == 0
+    )
+    block1 = next(
+        e for e in events if e.event_type == "content_block_start" and e.data["index"] == 1
+    )
+    assert block0.data["content_block"]["name"] == "alpha"
+    assert block0.data["content_block"]["id"] == "call_0"
+    assert block1.data["content_block"]["name"] == "beta"
+    assert block1.data["content_block"]["id"] == "call_1"
 
 
 @pytest.mark.asyncio
