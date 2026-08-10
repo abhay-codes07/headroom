@@ -294,6 +294,81 @@ async def test_send_message_builds_anthropic_response(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_send_message_converts_anthropic_tools_and_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic tools/tool_choice must reach any-llm in the OpenAI shape.
+
+    any-llm speaks OpenAI; forwarding the raw Anthropic ``input_schema`` tool and
+    the ``{"type": ...}`` tool_choice makes the provider ignore or reject them,
+    so the model never calls a tool. Regression for tool use silently not
+    working on the any-llm backend.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = make_response(make_choice("ok", "stop"))
+
+    await backend.send_message(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "look up weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+            "tool_choice": {"type": "any"},
+        },
+        {},
+    )
+
+    sent = instance.calls[0]
+    assert sent["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "look up weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+    assert sent["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
+async def test_stream_message_converts_anthropic_tools_and_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming request path converts tools/tool_choice the same way."""
+    backend, instance = make_backend(monkeypatch)
+    instance.response = FakeAsyncStream([])
+
+    _events = [
+        event
+        async for event in backend.stream_message(
+            {
+                "model": "claude",
+                "messages": [],
+                "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "t"},
+            },
+            {},
+        )
+    ]
+
+    sent = instance.calls[0]
+    assert sent["tools"] == [
+        {"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}
+    ]
+    assert sent["tool_choice"] == {"type": "function", "function": {"name": "t"}}
+
+
+@pytest.mark.asyncio
 async def test_send_message_returns_error_response(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, instance = make_backend(monkeypatch)
     instance.raise_error = RuntimeError("authentication api_key missing")
