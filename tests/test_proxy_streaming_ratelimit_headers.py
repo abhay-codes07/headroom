@@ -513,6 +513,56 @@ class TestStreamingRatelimitHeaderForwarding:
         mock_response.aclose.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_upstream_stream_released_over_asgi_lifecycle_on_disconnect(self):
+        """Driving the real ASGI response through an early disconnect releases the stream.
+
+        Rather than calling ``result.background()`` directly, this exercises the
+        Starlette response lifecycle with a client that disconnects immediately,
+        and asserts the upstream stream is closed by the end of it -- proving the
+        cleanup this PR attaches is actually invoked by Starlette, not merely
+        present on the response object.
+        """
+        import asyncio
+
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-asgi-lifecycle",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        async def receive():
+            # The client is already gone before the body is streamed.
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        scope = {"type": "http", "method": "POST", "headers": []}
+        await asyncio.wait_for(result(scope, receive, send), timeout=5.0)
+
+        # By the end of the response lifecycle the upstream stream is released.
+        mock_response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_codex_rate_limit_headers_captured_and_forwarded_in_streaming(self):
         """Codex x-codex-* headers must refresh /stats state AND reach the client.
 
