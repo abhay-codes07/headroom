@@ -324,42 +324,124 @@ class AnyLLMBackend(Backend):
                 },
             )
 
-            yield StreamEvent(
-                event_type="content_block_start",
-                data={
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-
             stream_response = await self.llm.acompletion(**kwargs)
             output_tokens = 0
+            # Open content blocks lazily as deltas arrive so a response can carry
+            # tool_use blocks (not just text). The previous version pre-opened a
+            # single text block at index 0 and only inspected ``delta.content``,
+            # so a tool call streamed back over any-llm was silently dropped even
+            # though ``tools``/``tool_choice`` are forwarded above — the client
+            # saw an empty turn and the agent loop stalled. Mirrors the
+            # non-streaming ``_to_anthropic_response`` and the LiteLLM streamer.
+            current_block_index = -1
+            active_block_type: str | None = None  # "text" or "tool_use"
+            tool_block_map: dict[int, int] = {}  # provider tc.index -> SSE block index
+            stop_reason = "end_turn"
 
             async for chunk in cast(AsyncIterator[Any], stream_response):
-                if hasattr(chunk, "choices") and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if hasattr(delta, "content") and delta.content:
+                if not (hasattr(chunk, "choices") and chunk.choices):
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # Map OpenAI finish_reason to the Anthropic stop_reason so a tool
+                # call or a length truncation is not reported as end_turn.
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                elif finish_reason == "length":
+                    stop_reason = "max_tokens"
+                elif finish_reason == "stop":
+                    stop_reason = "end_turn"
+
+                if getattr(delta, "tool_calls", None):
+                    for tc in delta.tool_calls:
+                        idx = tc.index if getattr(tc, "index", None) is not None else 0
+                        if idx not in tool_block_map:
+                            if active_block_type is not None:
+                                yield StreamEvent(
+                                    event_type="content_block_stop",
+                                    data={
+                                        "type": "content_block_stop",
+                                        "index": current_block_index,
+                                    },
+                                )
+                            current_block_index += 1
+                            tool_block_map[idx] = current_block_index
+                            active_block_type = "tool_use"
+                            tool_id = getattr(tc, "id", None) or f"toolu_{uuid.uuid4().hex[:24]}"
+                            func = getattr(tc, "function", None)
+                            tool_name = func.name if func and func.name else ""
+                            yield StreamEvent(
+                                event_type="content_block_start",
+                                data={
+                                    "type": "content_block_start",
+                                    "index": current_block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tool_id,
+                                        "name": tool_name,
+                                        "input": {},
+                                    },
+                                },
+                            )
+                        func = getattr(tc, "function", None)
+                        if func and func.arguments:
+                            yield StreamEvent(
+                                event_type="content_block_delta",
+                                data={
+                                    "type": "content_block_delta",
+                                    "index": tool_block_map[idx],
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": func.arguments,
+                                    },
+                                },
+                            )
+                            output_tokens += 1
+
+                elif getattr(delta, "content", None):
+                    if active_block_type != "text":
+                        if active_block_type is not None:
+                            yield StreamEvent(
+                                event_type="content_block_stop",
+                                data={
+                                    "type": "content_block_stop",
+                                    "index": current_block_index,
+                                },
+                            )
+                        current_block_index += 1
+                        active_block_type = "text"
                         yield StreamEvent(
-                            event_type="content_block_delta",
+                            event_type="content_block_start",
                             data={
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": delta.content},
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "text", "text": ""},
                             },
                         )
-                        output_tokens += 1
+                    yield StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "text_delta", "text": delta.content},
+                        },
+                    )
+                    output_tokens += 1
 
-            yield StreamEvent(
-                event_type="content_block_stop",
-                data={"type": "content_block_stop", "index": 0},
-            )
+            # Close the last open block, if any content or tool call arrived.
+            if active_block_type is not None:
+                yield StreamEvent(
+                    event_type="content_block_stop",
+                    data={"type": "content_block_stop", "index": current_block_index},
+                )
 
             yield StreamEvent(
                 event_type="message_delta",
                 data={
                     "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                     "usage": {"output_tokens": output_tokens},
                 },
             )

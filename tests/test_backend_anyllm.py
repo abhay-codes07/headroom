@@ -344,6 +344,87 @@ async def test_stream_message_yields_events_and_error(monkeypatch: pytest.Monkey
     assert error_events[-1].data["error"]["message"] == "stream broke"
 
 
+def _tool_call_delta(*, index, tc_id=None, name=None, arguments=None):  # noqa: ANN001, ANN202
+    """Build an OpenAI-style streaming tool_call delta chunk."""
+    func = SimpleNamespace(name=name, arguments=arguments)
+    tc = SimpleNamespace(index=index, id=tc_id, function=func)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(tool_calls=[tc]), finish_reason=None)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_message_emits_tool_use_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool call streamed over any-llm must surface as an Anthropic tool_use block.
+
+    Regression: the streamer only handled text deltas, so ``tools`` were
+    forwarded upstream but any tool call the model streamed back was dropped and
+    the client saw an empty turn with stop_reason=end_turn. The block must open,
+    stream its arguments as input_json_delta, and the turn must end tool_use.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = FakeAsyncStream(
+        [
+            _tool_call_delta(index=0, tc_id="call_abc", name="get_weather"),
+            _tool_call_delta(index=0, arguments='{"city":'),
+            _tool_call_delta(index=0, arguments='"paris"}'),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(), finish_reason="tool_calls")]
+            ),
+        ]
+    )
+
+    events = [
+        event async for event in backend.stream_message({"model": "claude", "messages": []}, {})
+    ]
+    types = [e.event_type for e in events]
+
+    assert types == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+
+    start = next(e for e in events if e.event_type == "content_block_start")
+    assert start.data["content_block"]["type"] == "tool_use"
+    assert start.data["content_block"]["id"] == "call_abc"
+    assert start.data["content_block"]["name"] == "get_weather"
+
+    arg_deltas = [e for e in events if e.event_type == "content_block_delta"]
+    assert [d.data["delta"]["type"] for d in arg_deltas] == ["input_json_delta", "input_json_delta"]
+    joined = "".join(d.data["delta"]["partial_json"] for d in arg_deltas)
+    assert joined == '{"city":"paris"}'
+
+    message_delta = next(e for e in events if e.event_type == "message_delta")
+    assert message_delta.data["delta"]["stop_reason"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_stream_message_maps_length_finish_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A truncated (length) text stream must report stop_reason=max_tokens."""
+    backend, instance = make_backend(monkeypatch)
+    instance.response = FakeAsyncStream(
+        [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="hi"), finish_reason=None)]
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(), finish_reason="length")]
+            ),
+        ]
+    )
+
+    events = [
+        event async for event in backend.stream_message({"model": "claude", "messages": []}, {})
+    ]
+    message_delta = next(e for e in events if e.event_type == "message_delta")
+    assert message_delta.data["delta"]["stop_reason"] == "max_tokens"
+
+
 @pytest.mark.asyncio
 async def test_send_openai_message_maps_choices_and_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
