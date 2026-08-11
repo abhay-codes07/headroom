@@ -6947,6 +6947,20 @@ def opencode(
             )
         subscription_resolution = _require_copilot_subscription_resolution()
 
+    # Verify the opencode binary exists BEFORE mutating any config. Otherwise a
+    # missing binary leaves headroom MCP/Serena/memory entries in the user's
+    # opencode config and an injected AGENTS.md, then errors with no cleanup --
+    # the config-before-verify anti-pattern (#1614). Siblings (claude, codex,
+    # goose, omp) already check first. `--prepare-only` intentionally writes
+    # config without launching, so it is exempt.
+    opencode_bin: str | None = None
+    if not prepare_only:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            click.echo("Error: 'opencode' not found in PATH.")
+            click.echo("Install OpenCode: https://opencode.ai")
+            raise SystemExit(1)
+
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
@@ -6987,11 +7001,9 @@ def opencode(
         inject_opencode_provider_config(port)
         return
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        click.echo("Error: 'opencode' not found in PATH.")
-        click.echo("Install OpenCode: https://opencode.ai")
-        raise SystemExit(1)
+    # Past the prepare-only return the launch path always ran the binary check
+    # above, so opencode_bin is resolved.
+    assert opencode_bin is not None
 
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
