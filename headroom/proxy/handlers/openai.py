@@ -8507,9 +8507,23 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
                 )
-                await self._ws_http_fallback(
+                (
+                    fb_input_tokens,
+                    fb_output_tokens,
+                    fb_cache_read_tokens,
+                    fb_cache_write_tokens,
+                    fb_uncached_tokens,
+                ) = await self._ws_http_fallback(
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
+                # Fold the fallback's provider usage into the session totals so
+                # the WS session-end outcome records the authoritative wire-token
+                # count instead of 0 (#2957).
+                ws_input_tokens_total += fb_input_tokens
+                ws_output_tokens_total += fb_output_tokens
+                ws_cache_read_tokens_total += fb_cache_read_tokens
+                ws_cache_write_tokens_total += fb_cache_write_tokens
+                ws_uncached_input_tokens_total += fb_uncached_tokens
 
             # ── WS session-end metric + RequestLog ──────────────────
             #
@@ -8759,14 +8773,31 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
-    ) -> None:
+    ) -> tuple[int, int, int, int, int]:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
         Converts the WS ``response.create`` message to an HTTP POST to
         ``/v1/responses?stream=true``, reads SSE events, and relays each
         ``data:`` line as a WS text message to the client.  This makes
         Codex work immediately instead of exhausting its WS retry budget.
+
+        Returns ``(input, output, cache_read, cache_write, uncached)`` provider
+        usage parsed from the ``response.completed`` SSE event. The caller folds
+        it into the session totals so the WS session-end outcome uses the
+        authoritative wire-token count; otherwise a fallback recorded
+        ``input_tokens=0`` and savings percentages blew past 100 (#2957).
         """
+        fallback_usage = [0, 0, 0, 0, 0]
+
+        def _accumulate_usage(data_str: str) -> None:
+            try:
+                event = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if isinstance(event, dict) and event.get("type") == "response.completed":
+                for i, value in enumerate(_extract_responses_usage(event)):
+                    fallback_usage[i] += value
+
         # Route to correct endpoint based on auth mode
         is_chatgpt_fallback = has_chatgpt_account_header(upstream_headers)
         if is_chatgpt_fallback:
@@ -8872,7 +8903,7 @@ class OpenAIHandlerMixin:
                                 },
                             }
                             await websocket.send_text(json.dumps(error_event))
-                            return
+                            return tuple(fallback_usage)  # type: ignore[return-value]
 
                         # Refresh Codex /stats from the fallback response
                         # headers. We can't forward them onto the client 101
@@ -8898,10 +8929,11 @@ class OpenAIHandlerMixin:
                                     data = line[6:]
                                     if data == "[DONE]":
                                         continue
+                                    _accumulate_usage(data)
                                     try:
                                         await websocket.send_text(data)
                                     except Exception:
-                                        return
+                                        return tuple(fallback_usage)  # type: ignore[return-value]
                                 elif line.startswith("event: "):
                                     # SSE event type — skip, the data line contains the type
                                     continue
@@ -8910,9 +8942,10 @@ class OpenAIHandlerMixin:
                         for line in buffer.strip().splitlines():
                             line = line.strip()
                             if line.startswith("data: ") and line[6:] != "[DONE]":
+                                _accumulate_usage(line[6:])
                                 with contextlib.suppress(Exception):
                                     await websocket.send_text(line[6:])
-                        return
+                        return tuple(fallback_usage)  # type: ignore[return-value]
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as http_err:
                     if http_attempt >= retry_attempts - 1:
                         raise
@@ -8943,6 +8976,7 @@ class OpenAIHandlerMixin:
         finally:
             with contextlib.suppress(Exception):
                 await websocket.close()
+        return tuple(fallback_usage)  # type: ignore[return-value]
 
     def _derived_compress_pipeline(self, key: str, **overrides: Any) -> Any:
         """Cached ``/v1/compress`` pipeline derived from the live OpenAI router.
