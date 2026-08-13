@@ -106,7 +106,9 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
             }
 
     monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
-    response = _loopback_client().get("/v1/toin/pattern/unknown")
+    # The addressable id is the tool-signature hash component ("abc123"), not the
+    # "auth|model|hash" head (#2928).
+    response = _loopback_client().get("/v1/toin/pattern/abc")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -117,6 +119,66 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+def _fake_toin_two_patterns():
+    class _FakeTOIN:
+        def export_patterns(self):
+            # Same auth|model tenant slice, different tool-signature hashes -- the
+            # single-tenant case where sig_hash[:12] made every id collide.
+            def _p(sample: int) -> dict:
+                return {
+                    "sample_size": sample,
+                    "total_compressions": sample,
+                    "total_retrievals": 0,
+                    "confidence": 0.5,
+                    "skip_compression_recommended": False,
+                    "optimal_max_items": 20,
+                }
+
+            return {
+                "patterns": {
+                    "unknown|unknown|aaaaaaaaaaaa1": _p(10),
+                    "unknown|unknown|bbbbbbbbbbbb2": _p(5),
+                }
+            }
+
+    return _FakeTOIN()
+
+
+def test_toin_patterns_hash_is_the_tool_hash_not_the_key_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #2928: two patterns in one tenant slice must report distinct hashes, not
+    # both "unknown|unkn" (the truncated auth|model head).
+    monkeypatch.setattr("headroom.proxy.server.get_toin", _fake_toin_two_patterns)
+    rows = _loopback_client().get("/v1/toin/patterns").json()
+
+    hashes = {row["hash"] for row in rows}
+    assert hashes == {"aaaaaaaaaaaa", "bbbbbbbbbbbb"}
+    assert "unknown|unkn" not in hashes
+
+
+def test_toin_pattern_detail_addresses_a_specific_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #2928: the id from /v1/toin/patterns must select exactly that pattern.
+    monkeypatch.setattr("headroom.proxy.server.get_toin", _fake_toin_two_patterns)
+    client = _loopback_client()
+
+    a = client.get("/v1/toin/pattern/aaaaaaaaaaaa").json()
+    b = client.get("/v1/toin/pattern/bbbbbbbbbbbb").json()
+    assert a["compressions"] == 10
+    assert b["compressions"] == 5
+
+
+def test_toin_tool_hash_extracts_hash_component() -> None:
+    from headroom.proxy.server import _toin_tool_hash
+
+    assert _toin_tool_hash("unknown|unknown|abc123") == "abc123"
+    assert _toin_tool_hash("bearer|opus|deadbeef") == "deadbeef"
+    # Legacy bare-hash format (no separator) is returned unchanged.
+    assert _toin_tool_hash("abc123") == "abc123"
 
 
 # CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).

@@ -2260,6 +2260,20 @@ class HeadroomProxy(
         raise last_error
 
 
+def _toin_tool_hash(sig_hash: str) -> str:
+    """Return the tool-signature-hash component of a TOIN aggregation key.
+
+    A serialized TOIN key is the composite ``"auth|model|hash"`` (see
+    ``telemetry.toin._serialize_pattern_key``). The ``/v1/toin/patterns`` "hash"
+    field is documented as the tool signature hash, but taking ``sig_hash[:12]``
+    returned the ``auth|model`` head instead, so every pattern in a single-tenant
+    deployment reported the same id and the detail lookup was arbitrary (#2928).
+    Take the component after the last separator; this is also correct for the
+    legacy bare-hash format (no separator).
+    """
+    return sig_hash.rsplit("|", 1)[-1]
+
+
 async def _log_toin_stats_periodically(interval_seconds: int = 300) -> None:
     """Background task that logs TOIN stats periodically.
 
@@ -4857,7 +4871,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": _toin_tool_hash(sig_hash)[:12],
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -4893,9 +4907,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
+        # Search for pattern whose tool-signature hash starts with the prefix.
+        # Match the same component /v1/toin/patterns advertises (#2928) rather
+        # than the full "auth|model|hash" key, whose head collides.
         for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
+            if _toin_tool_hash(sig_hash).startswith(hash_prefix):
                 # Keep this response aligned with /v1/toin/patterns while
                 # excluding query text, field semantics, and other internal
                 # learning state from the detail endpoint.
