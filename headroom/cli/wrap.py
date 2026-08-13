@@ -290,9 +290,13 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _CONTEXT_1M_SUFFIX = "[1m]"
-# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
-# current default Opus; the suffix logic preserves any model the user did set.
-_DEFAULT_1M_MODEL = "claude-opus-4-8"
+_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
+# Fallback model for `--1m` when nothing else selects one (no ANTHROPIC_MODEL,
+# no explicit --model). Overridable via HEADROOM_1M_MODEL so it can track new
+# Opus releases without a code change and without pinning ANTHROPIC_MODEL
+# globally (which would also change non-`--1m` sessions and override Claude
+# Code's /model picker). #2937.
+_DEFAULT_1M_MODEL = "claude-opus-5"
 _OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
@@ -300,11 +304,12 @@ def _resolve_1m_model(current: str | None) -> str:
     """Return the model id that makes Claude Code request the 1M window (#1158).
 
     Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
-    appending the ``[1m]`` suffix when missing); falls back to the default Opus
-    when none is set. Idempotent — a value already ending in ``[1m]`` is
-    returned unchanged.
+    appending the ``[1m]`` suffix when missing). When none is set it falls back
+    to ``HEADROOM_1M_MODEL`` if defined, else the built-in default Opus (#2937).
+    Idempotent — a value already ending in ``[1m]`` is returned unchanged.
     """
-    base = (current or "").strip() or _DEFAULT_1M_MODEL
+    fallback = (os.environ.get(_1M_MODEL_ENV) or "").strip() or _DEFAULT_1M_MODEL
+    base = (current or "").strip() or fallback
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
 
 
