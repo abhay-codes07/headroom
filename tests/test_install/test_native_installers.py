@@ -224,6 +224,11 @@ def _build_env(home: Path, tmp_path: Path) -> dict[str, str]:
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     env["FAKE_DOCKER_STATE"] = str(tmp_path / "fake-docker-state.json")
     env["FAKE_DOCKER_LOG"] = str(tmp_path / "fake-docker.log")
+    # #2970: the PowerShell installer's Ensure-PathEntry persists to the 'User'
+    # PATH scope (HKCU\Environment), which a HOME/USERPROFILE override does not
+    # redirect. Keep the PATH update ephemeral (Process scope) so running these
+    # tests never leaks the throwaway shim dir into the developer's real PATH.
+    env["HEADROOM_INSTALL_PATH_SCOPE"] = "Process"
     return env
 
 
@@ -553,6 +558,51 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
 
 def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> None:
+    """The installer must not mutate the real HKCU User PATH (#2970).
+
+    ``Ensure-PathEntry`` persists to the 'User' scope, which a HOME/USERPROFILE
+    override does not redirect, so running the installer against a throwaway home
+    used to leak the temp shim dir into the developer's real PATH. ``_build_env``
+    now sets ``HEADROOM_INSTALL_PATH_SCOPE=Process`` to keep the update
+    ephemeral; the real User PATH must be unchanged across the run.
+    """
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    count_cmd = [
+        powershell,
+        "-NoProfile",
+        "-Command",
+        "([Environment]::GetEnvironmentVariable('Path','User') -split ';').Count",
+    ]
+    before = _run(count_cmd, env=os.environ.copy()).stdout.strip()
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    _run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+    )
+
+    after = _run(count_cmd, env=os.environ.copy()).stdout.strip()
+    assert after == before, f"installer leaked into the real User PATH: {before} -> {after}"
 
 
 @pytest.mark.skipif(

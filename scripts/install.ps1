@@ -22,14 +22,22 @@ function Require-Command {
 function Ensure-PathEntry {
     param([string]$PathEntry)
 
-    $currentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    # Persist to the User PATH by default. The 'User' scope lives in
+    # HKCU\Environment and is NOT redirected by a HOME/USERPROFILE override, so a
+    # caller that must not mutate the real persistent PATH (the installer test
+    # suite, which runs this against a throwaway fake home) sets
+    # HEADROOM_INSTALL_PATH_SCOPE=Process to keep the update ephemeral instead of
+    # leaking the temp shim dir into the developer's actual user PATH (#2970).
+    $scope = if ($env:HEADROOM_INSTALL_PATH_SCOPE) { $env:HEADROOM_INSTALL_PATH_SCOPE } else { 'User' }
+
+    $currentPath = [Environment]::GetEnvironmentVariable('Path', $scope)
     $parts = @()
     if ($currentPath) {
         $parts = $currentPath -split ';' | Where-Object { $_ }
     }
     if ($parts -notcontains $PathEntry) {
         $newPath = @($PathEntry) + $parts
-        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), 'User')
+        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), $scope)
     }
 }
 
