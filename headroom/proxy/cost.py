@@ -129,22 +129,6 @@ _CACHE_ECONOMICS = {
 }
 
 
-def _cache_economics_provider(litellm_provider: str | None) -> str:
-    """Map a LiteLLM ``litellm_provider`` id to a ``_CACHE_ECONOMICS`` key.
-
-    Unknown or absent providers fall back to ``anthropic``, matching the default
-    used in :func:`build_prefix_cache_stats`.
-    """
-    provider = (litellm_provider or "").lower()
-    if "bedrock" in provider:
-        return "bedrock"
-    if provider.startswith(("gemini", "vertex_ai", "google")):
-        return "gemini"
-    if provider.startswith(("openai", "azure", "text-completion-openai")):
-        return "openai"
-    return "anthropic"
-
-
 def _summarize_transforms(transforms: list[str]) -> str:
     """Collapse repeated transforms into counted summary.
 
@@ -1070,28 +1054,26 @@ class CostTracker:
             # LiteLLM carries explicit per-token cache prices for only a minority
             # of its priced models; the long tail (most Bedrock, Mistral,
             # Fireworks and OpenAI-compatible gateway models) omits them. The old
-            # ``.get(field, uncached)`` default billed cache reads at the FULL
-            # uncached rate and cache writes with no premium, so ``totals()`` (and
-            # the /stats dollar figures it feeds) over-charged every cache-warm
-            # request on those models and diverged from the primary
-            # ``litellm.cost_per_token`` path. When a field is absent, fall back to
-            # the provider cache economics the dashboard already uses: reads at the
-            # discounted multiplier, writes at the write multiplier, defaulting to
-            # Anthropic's when the provider is unknown (matching
-            # ``build_prefix_cache_stats``).
+            # ``.get(field, uncached)`` default billed those cache reads at the
+            # FULL uncached rate (and cache writes with no premium), so ``totals()``
+            # (and the /stats dollar figures it feeds) over-charged every cache-warm
+            # request on those models.
+            #
+            # Do NOT substitute a provider guess for a missing rate. Bedrock alone
+            # fronts Anthropic, Amazon, Meta, Mistral, Cohere and others whose cache
+            # economics are not interchangeable, and ``_CACHE_ECONOMICS`` is a
+            # coarse dashboard-savings convention, not per-model billing metadata.
+            # Fail closed instead: reconcile with the canonical
+            # ``litellm.cost_per_token`` path (the one ``estimate_cost`` uses),
+            # which books $0 for a cache slice LiteLLM cannot price, so ``totals()``
+            # agrees with the primary accounting rather than inventing a discount
+            # or a premium. Explicit LiteLLM cache fields still win.
             cache_read = info.get("cache_read_input_token_cost")
             cache_write = info.get("cache_creation_input_token_cost")
-            if cache_read is None or cache_write is None:
-                econ = _CACHE_ECONOMICS.get(
-                    _cache_economics_provider(info.get("litellm_provider")),
-                    _CACHE_ECONOMICS["anthropic"],
-                )
-                read_mult: float = econ["read_multiplier"]  # type: ignore[assignment]
-                write_mult: float = econ["write_multiplier"]  # type: ignore[assignment]
-                if cache_read is None:
-                    cache_read = uncached * read_mult
-                if cache_write is None:
-                    cache_write = uncached * write_mult
+            if cache_read is None:
+                cache_read = 0.0
+            if cache_write is None:
+                cache_write = 0.0
             return (cache_read, cache_write, uncached)
         except Exception:
             return None
