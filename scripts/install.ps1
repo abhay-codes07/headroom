@@ -28,7 +28,23 @@ function Ensure-PathEntry {
     # suite, which runs this against a throwaway fake home) sets
     # HEADROOM_INSTALL_PATH_SCOPE=Process to keep the update ephemeral instead of
     # leaking the temp shim dir into the developer's actual user PATH (#2970).
-    $scope = if ($env:HEADROOM_INSTALL_PATH_SCOPE) { $env:HEADROOM_INSTALL_PATH_SCOPE } else { 'User' }
+    #
+    # Only those two persistence modes are supported. The value is handed to
+    # .NET's EnvironmentVariableTarget, whose 'Machine' member would rewrite the
+    # SYSTEM-wide PATH if this variable were inherited by an elevated installer,
+    # and a typo would otherwise fail late with an opaque enum-conversion error.
+    # Normalize case-insensitively and allow-list 'User'/'Process', failing early
+    # and clearly for 'Machine' or anything else.
+    $scope = 'User'
+    if ($env:HEADROOM_INSTALL_PATH_SCOPE) {
+        switch ($env:HEADROOM_INSTALL_PATH_SCOPE.Trim().ToLowerInvariant()) {
+            'user' { $scope = 'User' }
+            'process' { $scope = 'Process' }
+            default {
+                throw "HEADROOM_INSTALL_PATH_SCOPE must be 'User' or 'Process' (got '$($env:HEADROOM_INSTALL_PATH_SCOPE)'); 'Machine' and other targets are not supported."
+            }
+        }
+    }
 
     $currentPath = [Environment]::GetEnvironmentVariable('Path', $scope)
     $parts = @()

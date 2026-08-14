@@ -605,6 +605,80 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
     assert after == before, f"installer leaked into the real User PATH: {before} -> {after}"
 
 
+# AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
+# a given HEADROOM_INSTALL_PATH_SCOPE, so the scope allow-list is exercised
+# without running the whole installer. Parsing via the PowerShell AST (not a
+# regex) keeps this pinned to the real function body. Only 'Process' (ephemeral)
+# and the throwing paths are driven — never 'User', which would mutate the real
+# HKCU PATH.
+_ENSURE_PATH_SCOPE_HARNESS = r"""
+param([string]$InstallScript, [string]$ScopeValue)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$fn = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Ensure-PathEntry'
+}, $true) | Select-Object -First 1
+if (-not $fn) { Write-Output 'NOFUNC'; exit 3 }
+Invoke-Expression $fn.Extent.Text
+$env:HEADROOM_INSTALL_PATH_SCOPE = $ScopeValue
+try {
+    Ensure-PathEntry -PathEntry 'C:\headroom-scope-test-marker'
+    Write-Output 'OK'
+} catch {
+    Write-Output ('ERR:' + $_.Exception.Message)
+}
+"""
+
+
+def _invoke_scope_harness(scope_value: str, tmp_path: Path) -> str:
+    powershell = _powershell_executable()
+    assert powershell is not None
+    harness = tmp_path / "scope_harness.ps1"
+    harness.write_text(_ENSURE_PATH_SCOPE_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+            "-ScopeValue",
+            scope_value,
+        ],
+        env=os.environ.copy(),
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_accepts_process_case_insensitively(tmp_path: Path) -> None:
+    """'Process' (any case) is a supported ephemeral target: Ensure-PathEntry runs."""
+    assert _invoke_scope_harness("process", tmp_path).endswith("OK")
+    assert _invoke_scope_harness("Process", tmp_path).endswith("OK")
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
+    """'Machine' (system-wide) and typos must fail early, before any PATH write."""
+    for bad in ("Machine", "machine", "system", "bogus"):
+        out = _invoke_scope_harness(bad, tmp_path)
+        assert out.startswith("ERR:"), f"scope {bad!r} was not rejected: {out!r}"
+        assert "User" in out and "Process" in out, out
+
+
 @pytest.mark.skipif(
     os.name != "nt" or _powershell_executable() is None,
     reason="Windows PowerShell coverage runs on Windows hosts only",
