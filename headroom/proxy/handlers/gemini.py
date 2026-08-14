@@ -869,9 +869,22 @@ class GeminiHandlerMixin:
                     resp_json = final_resp_json
                     response_content = json.dumps(resp_json).encode()
                     usage = resp_json.get("usageMetadata", {})
-                    total_input_tokens = usage.get("promptTokenCount", total_input_tokens)
-                    output_tokens = usage.get("candidatesTokenCount", output_tokens)
-                    cache_read_tokens = usage.get("cachedContentTokenCount", cache_read_tokens)
+                    # A CCR continuation response can carry a present-null count
+                    # (e.g. a safety-blocked continuation turn), where
+                    # ``.get(key, prior)`` returns None rather than the prior
+                    # value, and the ``max(0, prompt - cache_read)`` /
+                    # ``total_input_tokens > 0`` arithmetic below would then raise
+                    # TypeError and the outer handler would mask a successful 200
+                    # as a synthetic 502. Guard with ``_usage_int`` (keeping the
+                    # pre-continuation count as the fallback), mirroring the two
+                    # sibling extraction sites above.
+                    total_input_tokens = _usage_int(
+                        usage.get("promptTokenCount"), total_input_tokens
+                    )
+                    output_tokens = _usage_int(usage.get("candidatesTokenCount"), output_tokens)
+                    cache_read_tokens = _usage_int(
+                        usage.get("cachedContentTokenCount"), cache_read_tokens
+                    )
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
