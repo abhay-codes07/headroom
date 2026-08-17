@@ -3183,7 +3183,12 @@ class AnthropicHandlerMixin:
                         # Track metrics
                         total_latency = (time.time() - start_time) * 1000
                         usage = backend_response.body.get("usage", {})
-                        output_tokens = usage.get("output_tokens", 0)
+                        # A backend may report these counters as JSON null (key
+                        # present, value null), for which ``.get(key, 0)`` returns
+                        # ``None`` rather than the default. Coerce with ``or 0`` so
+                        # the arithmetic below (and ``RequestOutcome``) never sees
+                        # ``None`` — matching the direct-Anthropic path.
+                        output_tokens = int(usage.get("output_tokens", 0) or 0)
 
                         _backend_name = request_backend.name if request_backend else "anthropic"
                         # Eligible-only denominator for the active
@@ -3202,8 +3207,8 @@ class AnthropicHandlerMixin:
                         except Exception:
                             attempted_input_tokens = original_tokens
 
-                        cr_tokens = usage.get("cache_read_input_tokens", 0)
-                        cw_tokens = usage.get("cache_creation_input_tokens", 0)
+                        cr_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                        cw_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
