@@ -48,8 +48,15 @@ WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
 
-_LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+# Loopback host forms a proxy URL can take: IPv4, the ``localhost`` alias, and
+# the IPv6 literal ``[::1]``. IGNORECASE because URL schemes and hostnames are
+# case-insensitive — a hand-set ``HTTP://Localhost`` or ``http://[::1]`` is a
+# valid loopback route, and failing to match it makes `doctor` report a
+# correctly-routed session as "not routed", sending the user to debug a
+# non-problem (the false-negative class of #3205 / #3213).
+_LOOPBACK_HOST = r"(?:127\.0\.0\.1|\[::1\]|localhost)"
+_LOOPBACK_URL_RE = re.compile(rf"https?://{_LOOPBACK_HOST}:(\d+)", re.IGNORECASE)
+_CODEX_BASE_URL_RE = re.compile(rf'base_url\s*=\s*"https?://{_LOOPBACK_HOST}:(\d+)', re.IGNORECASE)
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code

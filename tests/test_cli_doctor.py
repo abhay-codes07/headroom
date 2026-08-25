@@ -132,6 +132,28 @@ class TestClaudeRouting:
         )
         assert check_claude_routing(path, 8787).status == PASS
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:8787",
+            "http://[::1]:8787",  # IPv6 loopback literal
+            "http://[::1]:8787/v1",
+            "HTTP://Localhost:8787",  # scheme/host are case-insensitive
+            "http://LOCALHOST:8787",
+        ],
+    )
+    def test_loopback_url_variants_pass(self, tmp_path, base_url):
+        """A correctly-routed loopback URL must not read as 'not routed'.
+
+        The routing regex only matched lowercase ``127.0.0.1``/``localhost`` with
+        an explicit port, so an IPv6 (``[::1]``) or upper-cased loopback URL — a
+        valid route — produced a misleading WARN (the false-negative class of
+        #3205 / #3213).
+        """
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == PASS
+
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "settings.json"
         path.write_text(
