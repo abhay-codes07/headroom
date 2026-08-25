@@ -82,26 +82,32 @@ class SQLiteBackend:
 
     @staticmethod
     def _ensure_private(path: Path) -> None:
-        """Make the database file 0600 *before* sqlite opens it.
+        """Make the database file 0600 *before* sqlite opens it, failing CLOSED.
 
         The originals stored here can contain sensitive tool output (file
         contents, command output). ``mkdir`` created the parent at the umask
         default (typically world-traversable ``0o755``), and sqlite would
         otherwise create the db file itself at the umask default too — leaving it
-        world/group readable in the window before the post-commit ``chmod`` below
-        narrows it (or permanently, if the process dies in that window). Creating
-        the file with an explicit ``0o600`` mode makes a *new* db private from
-        birth; a pre-existing file is narrowed in place. sqlite treats the empty
-        file as a fresh database. Best-effort: on Windows POSIX perms do not
-        apply, so failures are ignored.
+        world/group readable. This creates the file with an explicit ``0o600``
+        mode before ``sqlite3.connect`` runs (a *new* db is private from birth;
+        sqlite treats the empty file as a fresh database), or narrows a
+        pre-existing db.
+
+        A store of raw tool output must not be opened world-readable, so a
+        failure to create or narrow it privately **raises** rather than silently
+        proceeding to open a wide file. ``O_EXCL`` on the create refuses to
+        follow a symlink or reuse an attacker-planted file. On Windows POSIX bits
+        do not apply — ``os.open``/``os.chmod`` succeed without raising, so this
+        is a no-op there.
         """
         try:
-            if path.exists():
-                path.chmod(0o600)
-            else:
-                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-        except OSError:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return
+        except FileExistsError:
             pass
+        # Existing db: narrow it. A failure here aborts (fail closed) rather
+        # than opening a store of raw originals with wider permissions.
+        os.chmod(path, 0o600)
 
     def _open(self) -> sqlite3.Connection:
         self._ensure_private(self._path)

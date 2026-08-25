@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -614,34 +615,36 @@ def read_headroom_copilot_oauth_token() -> str | None:
 
 
 def _write_private_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` so the file is never world/group readable.
+    """Atomically write ``text`` to ``path`` so it is never world/group readable.
 
-    The token file holds a GitHub Copilot OAuth refresh token. Writing with
-    ``path.write_text`` then ``chmod(0o600)`` creates the file at the umask
-    default (typically ``0o644``) and only narrows it afterward, leaving a
-    window — or, if the process dies between the two calls, a permanent state —
-    where a local unprivileged user can read the token.
+    The token file holds a GitHub Copilot OAuth refresh token. Rather than
+    create-or-narrow the destination in place — which fails *open* if a pre-write
+    ``chmod`` is refused (the secret still lands in a wide file), and is exposed
+    to a symlink/path-replacement race between the check and the ``open`` — write
+    the secret to a fresh private temp file and atomically rename it into place:
 
-    ``os.open`` with an explicit ``0o600`` mode makes a *new* file private from
-    birth (umask can only clear bits, never add them, and ``0o600`` already has
-    none for group/other). An existing file's mode is not changed by ``O_CREAT``,
-    so narrow it first — before the new secret is written into it — and once more
-    after, belt-and-suspenders. Mirrors ``telemetry/session.py``'s install-id
-    write. On Windows ``chmod`` is largely a no-op and POSIX perms do not apply,
-    so failures are ignored.
+    * ``tempfile.mkstemp`` creates the temp with ``0o600`` and ``O_EXCL`` (it
+      never follows a symlink and never reuses an attacker-planted file), so the
+      secret is private from birth.
+    * ``os.replace`` swaps it into place atomically; the destination inherits the
+      temp's ``0o600`` mode. The existing file is never opened, ``chmod``-ed, or
+      truncated, so a permission/platform error fails **closed** — it raises
+      before the old file is touched (old contents preserved) and the temp is
+      cleaned up, rather than leaving a secret in a readable file.
+
+    On Windows POSIX bits do not apply, but ``mkstemp`` still restricts the file
+    to the owner and ``os.replace`` is atomic.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        if path.exists():
-            path.chmod(0o600)
-    except OSError:
-        pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def save_headroom_copilot_oauth_token(

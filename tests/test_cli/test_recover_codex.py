@@ -19,16 +19,14 @@ from headroom.providers.codex.recovery import discover_dangling_homes, recover_c
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
-def test_write_private_text_is_born_private(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The backup manifest must be *created* 0o600, not narrowed after.
+def test_write_private_text_is_private_under_permissive_umask(tmp_path: Path) -> None:
+    """The backup manifest must be 0o600 regardless of umask.
 
-    Neutralize every chmod and force a permissive umask so the mode reflects
-    only how the file was created: born-private ``os.open(..., 0o600)`` yields
-    0o600, while the old write-then-chmod would leave the umask default 0o644.
+    The atomic writer creates the file via ``tempfile.mkstemp`` (always 0o600)
+    and ``os.replace``s it into place, so the mode does not depend on umask.
+    Forcing ``umask(0o022)`` (which would make a plain ``write_text`` land 0o644)
+    confirms the file is private from birth.
     """
-    monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
     target = tmp_path / "manifest.json"
     old_umask = os.umask(0o022)
     try:
@@ -38,6 +36,30 @@ def test_write_private_text_is_born_private(
 
     assert target.read_text(encoding="utf-8") == '{"ok": true}\n'
     assert (target.stat().st_mode & 0o777) == 0o600
+
+
+def test_write_private_text_fails_closed_preserving_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed rename must not truncate or replace an existing manifest.
+
+    The write lands in a private temp file and is atomically renamed in, so a
+    failure at ``os.replace`` leaves the old contents intact and cleans up the
+    temp — never a partial or world-readable secret in place.
+    """
+    target = tmp_path / "manifest.json"
+    codex_recovery._write_private_text(target, '{"v": 1}\n')
+    before = set(os.listdir(tmp_path))
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(codex_recovery.os, "replace", boom)
+    with pytest.raises(OSError):
+        codex_recovery._write_private_text(target, '{"v": 2}\n')
+
+    assert target.read_text(encoding="utf-8") == '{"v": 1}\n'
+    assert set(os.listdir(tmp_path)) == before
 
 
 def _write_db(path: Path, rows: list[tuple[str, str]]) -> None:

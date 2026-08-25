@@ -59,30 +59,41 @@ class TestSQLiteBackend:
         assert not b.delete("h1")
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
-    def test_db_file_is_born_private(self, db_path, monkeypatch):
-        """The CCR db (sensitive tool output) must be *created* 0o600.
+    def test_db_file_is_private_under_permissive_umask(self, db_path):
+        """The CCR db (sensitive tool output) must be 0o600 under any umask.
 
-        ``test_database_file_is_private`` already asserts the *final* mode, but
-        the trailing chmod loop always makes that 0o600 — it cannot see that
-        sqlite created the file world-readable and it was only narrowed after
-        the first write. This neutralizes every chmod and forces a permissive
-        umask so the mode reflects only how the file was *created*: pre-creating
-        it via ``os.open(..., 0o600)`` before ``sqlite3.connect`` yields 0o600,
-        while letting sqlite create it under the old code would leave 0o644.
+        ``_ensure_private`` creates the db with an explicit ``0o600`` mode
+        (``O_CREAT | O_EXCL``) before ``sqlite3.connect`` opens it, so it is
+        private from birth. Forcing ``umask(0o022)`` — which would make sqlite
+        create it 0o644 — confirms the mode is umask-independent.
         """
-        from pathlib import Path as _Path
-
-        monkeypatch.setattr(_Path, "chmod", lambda self, mode: None)
         old_umask = os.umask(0o022)
         try:
-            SQLiteBackend(db_path)  # fresh open
+            SQLiteBackend(db_path)  # fresh open, private from birth
         finally:
             os.umask(old_umask)
 
         assert db_path.exists()
-        assert (db_path.stat().st_mode & 0o777) == 0o600, (
-            "db must be created private, not narrowed after sqlite creates it wide"
-        )
+        assert (db_path.stat().st_mode & 0o777) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX chmod semantics")
+    def test_open_fails_closed_when_db_cannot_be_made_private(self, db_path, monkeypatch):
+        """If an existing db cannot be narrowed, opening must abort (fail closed).
+
+        A store of raw tool output must not be opened world-readable, so
+        ``_ensure_private`` raises rather than silently proceeding to
+        ``sqlite3.connect`` on a db it could not make private.
+        """
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        db_path.write_text("")  # pre-existing db file
+
+        def boom(path, mode):
+            raise PermissionError("cannot chmod")
+
+        monkeypatch.setattr(sqlite_mod.os, "chmod", boom)
+        with pytest.raises(PermissionError):
+            SQLiteBackend(db_path)
 
     def test_survives_reopen(self, db_path):
         """The restart-survival property the default flip exists for."""

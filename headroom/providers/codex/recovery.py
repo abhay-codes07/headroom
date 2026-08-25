@@ -405,28 +405,29 @@ def _quote(identifier: str) -> str:
 
 
 def _write_private_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` without a world/group-readable window.
+    """Atomically write ``text`` to ``path`` without a world/group-readable window.
 
-    The backup manifest records the recovered account's file layout. Writing via
-    ``write_text`` then ``chmod(0o600)`` creates the file at the umask default
-    (typically ``0o644``) and only narrows it afterward, so a local user can read
-    it in the gap — or permanently, if the process dies between the two calls.
-    ``os.open`` with an explicit ``0o600`` mode makes a *new* file private from
-    birth; an existing file is narrowed first (before new content is written) and
-    again after. Mirrors ``telemetry/session.py``'s install-id write.
+    The backup manifest records the recovered account's file layout. Rather than
+    create-or-narrow the destination in place — which fails *open* if a pre-write
+    ``chmod`` is refused, and is exposed to a symlink swap between the check and
+    the ``open`` — write to a fresh private temp file and atomically rename it in:
+    ``tempfile.mkstemp`` creates it ``0o600`` with ``O_EXCL`` (never follows a
+    symlink, never reuses a planted file), and ``os.replace`` swaps it in
+    atomically, the destination inheriting ``0o600``. The existing file is never
+    opened or truncated, so a permission/platform error fails **closed** — it
+    raises before the old file is touched, and the temp is cleaned up. Mirrors the
+    Copilot auth writer.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        if path.exists():
-            path.chmod(0o600)
-    except OSError:
-        pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _database_schema(connection: sqlite3.Connection, schema: str) -> dict[str, str]:
