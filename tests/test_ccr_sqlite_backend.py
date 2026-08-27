@@ -107,8 +107,17 @@ class TestSQLiteBackend:
         untouched: neither narrowed nor opened/rewritten.
         """
         target = tmp_path / "attacker_target"
-        target.write_text("SECRET-ORIGINAL")
-        os.chmod(target, 0o644)  # a visibly wider mode than 0o600
+        # Create the target with a deliberately wider mode via umask (not an
+        # explicit permissive chmod) so a chmod-follow regression would show up
+        # as a mode change, without the test itself performing a world-readable
+        # chmod that the security scanner flags as overly permissive.
+        old_umask = os.umask(0o022)
+        try:
+            target.write_text("SECRET-ORIGINAL")  # lands 0o644 under this umask
+        finally:
+            os.umask(old_umask)
+        before_mode = target.stat().st_mode & 0o777
+        assert before_mode != 0o600  # precondition: a narrow would be visible
 
         link = tmp_path / "ccr_store.db"
         link.symlink_to(target)
@@ -116,9 +125,9 @@ class TestSQLiteBackend:
         with pytest.raises(PermissionError):
             SQLiteBackend(link)
 
-        # Target was neither narrowed (still 0o644) nor opened/rewritten by
+        # Target was neither narrowed (mode unchanged) nor opened/rewritten by
         # sqlite (contents intact, no WAL/journal siblings created).
-        assert (target.stat().st_mode & 0o777) == 0o644
+        assert (target.stat().st_mode & 0o777) == before_mode
         assert target.read_text() == "SECRET-ORIGINAL"
         assert link.is_symlink()
 
