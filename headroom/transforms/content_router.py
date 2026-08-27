@@ -1947,7 +1947,19 @@ class ContentRouter(Transform):
         # we match that posture with a dedicated lock rather than relying on
         # GIL atomicity (which would not protect the read-then-evict sequence).
         self._frozen_verdicts: dict[int, bool] = {}
-        self._frozen_verdicts_max = 4096
+        # The store is process-wide (one router per pipeline, shared by every
+        # session), so the cap must scale with the number of CONCURRENT
+        # sessions, not one user's workload: at org scale (many users behind
+        # one sidecar) 4096 churns in minutes and FIFO eviction lets tightened
+        # thresholds flip a still-cached block's verdict — a prefix bust.
+        # Read at construction so tests and multi-tenant deployments can size
+        # it via HEADROOM_FROZEN_VERDICTS_MAX without a module reload.
+        try:
+            self._frozen_verdicts_max = max(
+                256, int(os.environ.get("HEADROOM_FROZEN_VERDICTS_MAX", "4096"))
+            )
+        except ValueError:
+            self._frozen_verdicts_max = 4096
         self._frozen_lock = threading.Lock()
         # Reset verdicts whenever the shadowed cache is cleared.
         self._cache.register_on_clear(self._clear_frozen_verdicts)
@@ -2454,7 +2466,13 @@ class ContentRouter(Transform):
         )
         sections_source = cleaned if protected else content
 
-        sections = split_into_sections(sections_source)
+        # Placeholder lines must each be their own section (see the
+        # placeholder passthrough below): a placeholder sharing a section
+        # with prose would drag that prose into verbatim passthrough.
+        sections = split_into_sections(
+            sections_source,
+            isolate=tuple(placeholder for placeholder, _ in protected),
+        )
         if logger.isEnabledFor(logging.DEBUG):
             _log_router_debug(
                 "content_router_mixed_sections",
@@ -2513,6 +2531,24 @@ class ContentRouter(Transform):
             # Preserve code fence markers
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
+
+            # A JSON_ARRAY section whose compressed form is a bare JSON
+            # *string* (SmartCrusher's lossless CSV+schema render replaces
+            # the whole array with one string value) must be spliced back
+            # as the raw text it encodes. Left as the JSON literal, the
+            # section lands mid-prose as one quote-wrapped line with `\n`
+            # as two-character escapes — the classic "compression garbled
+            # the output" report. Valid inside a JSON document; unreadable
+            # inside mixed text.
+            if section.content_type is ContentType.JSON_ARRAY and compressed_content.startswith(
+                '"'
+            ):
+                try:
+                    _unwrapped = json.loads(compressed_content)
+                except (TypeError, ValueError):
+                    _unwrapped = None
+                if isinstance(_unwrapped, str):
+                    compressed_content = _unwrapped
 
             compressed_sections.append(compressed_content)
             routing_log.append(
