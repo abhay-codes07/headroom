@@ -86,14 +86,41 @@ class TestSQLiteBackend:
         """
         import headroom.cache.backends.sqlite as sqlite_mod
 
-        db_path.write_text("")  # pre-existing db file
+        db_path.write_text("")  # pre-existing regular db file
 
-        def boom(path, mode):
-            raise PermissionError("cannot chmod")
+        def boom(fd, mode):
+            raise PermissionError("cannot fchmod")
 
-        monkeypatch.setattr(sqlite_mod.os, "chmod", boom)
+        # The existing-file path narrows through the descriptor (fchmod), so a
+        # narrowing failure there must still abort the open.
+        monkeypatch.setattr(sqlite_mod.os, "fchmod", boom)
         with pytest.raises(PermissionError):
             SQLiteBackend(db_path)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_open_fails_closed_on_symlinked_db_path(self, tmp_path):
+        """A symlinked db path must be refused without following it.
+
+        If the db path is a symlink an attacker planted, ``_ensure_private``
+        must fail closed (O_NOFOLLOW) rather than chmod-ing and handing the
+        attacker-chosen target to ``sqlite3.connect``. The target must be left
+        untouched: neither narrowed nor opened/rewritten.
+        """
+        target = tmp_path / "attacker_target"
+        target.write_text("SECRET-ORIGINAL")
+        os.chmod(target, 0o644)  # a visibly wider mode than 0o600
+
+        link = tmp_path / "ccr_store.db"
+        link.symlink_to(target)
+
+        with pytest.raises(PermissionError):
+            SQLiteBackend(link)
+
+        # Target was neither narrowed (still 0o644) nor opened/rewritten by
+        # sqlite (contents intact, no WAL/journal siblings created).
+        assert (target.stat().st_mode & 0o777) == 0o644
+        assert target.read_text() == "SECRET-ORIGINAL"
+        assert link.is_symlink()
 
     def test_survives_reopen(self, db_path):
         """The restart-survival property the default flip exists for."""
