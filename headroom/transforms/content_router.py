@@ -2161,11 +2161,17 @@ class ContentRouter(Transform):
             logger.debug("TOIN recording failed (non-fatal): %s", e)
 
     def _timed_compress(
-        self, content: str, context: str, bias: float
+        self,
+        content: str,
+        context: str,
+        bias: float,
+        precomputed_detection: DetectionResult | None = None,
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        result = self.compress(
+            content, context=context, bias=bias, precomputed_detection=precomputed_detection
+        )
         return result, (time.perf_counter() - t0) * 1000
 
     def compress(
@@ -2174,6 +2180,7 @@ class ContentRouter(Transform):
         context: str = "",
         question: str | None = None,
         bias: float = 1.0,
+        precomputed_detection: DetectionResult | None = None,
     ) -> RouterCompressionResult:
         """Compress content using optimal strategy based on content detection.
 
@@ -2183,6 +2190,12 @@ class ContentRouter(Transform):
             question: Optional question for QA-aware compression. When provided,
                 tokens relevant to answering this question are preserved.
             bias: Compression bias multiplier (>1 = keep more, <1 = keep fewer).
+            precomputed_detection: A ``_detect_content(content)`` result the
+                caller already computed for the same content. When supplied, it
+                is reused instead of re-running the native detection chain — the
+                router's hottest per-message cost. ``apply`` computes detection
+                once per message (for its code-protection checks) and passes it
+                here so a cache-miss message is not detected twice.
 
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
@@ -2230,7 +2243,11 @@ class ContentRouter(Transform):
                 strategy = CompressionStrategy.KOMPRESS
             else:
                 mixed = is_mixed_content(content)
-                detection = _detect_content(content)
+                detection = (
+                    precomputed_detection
+                    if precomputed_detection is not None
+                    else _detect_content(content)
+                )
                 strategy = self._determine_strategy(content, mixed=mixed, detection=detection)
             if debug_enabled:
                 _log_router_debug(
@@ -5079,8 +5096,11 @@ class ContentRouter(Transform):
                 if idle_f is not None and math.isfinite(idle_f) and idle_f >= 0.0:
                     netcost_p_alive_override = max(0.0, 1.0 - idle_f / netcost_ttl)
 
-        # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int, bool]
+        # Tasks: list of (slot_index, content, context, bias, content_key,
+        # enforce_reversibility, precomputed_detection). The detection is the one
+        # already computed in the routing loop below, threaded through so a
+        # cache-miss message is not re-detected inside compress().
+        _PendingTask = tuple[int, str, str, float, int, bool, "DetectionResult | None"]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -5415,11 +5435,23 @@ class ContentRouter(Transform):
                 route_counts["cache_hit"] += 1
                 continue
 
-            # Cache miss — defer to parallel compression pass
+            # Cache miss — defer to parallel compression pass. Carry the
+            # detection already computed above so compress() need not re-run the
+            # native detection chain on this same content. Only the full
+            # detection is reused; under force_kompress the loop used the
+            # lightweight regex detector and compress() skips detection entirely.
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
             pending_tasks.append(
-                (i, content, context, msg_bias, content_key, enforce_reversibility)
+                (
+                    i,
+                    content,
+                    context,
+                    msg_bias,
+                    content_key,
+                    enforce_reversibility,
+                    None if force_kompress else detection,
+                )
             )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
@@ -5432,7 +5464,7 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                     t0 = time.perf_counter()
                     deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
                     if deadline_s:
@@ -5443,10 +5475,14 @@ class ContentRouter(Transform):
                             _content: str = task_content,
                             _context: str = task_ctx,
                             _bias: float = task_bias,
+                            _detection: DetectionResult | None = task_detection,
                         ) -> None:
                             try:
                                 _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
+                                    _content,
+                                    context=_context,
+                                    bias=_bias,
+                                    precomputed_detection=_detection,
                                 )
                             except BaseException as exc:  # noqa: BLE001
                                 _box["error"] = exc
@@ -5473,16 +5509,27 @@ class ContentRouter(Transform):
                         else:
                             r = box["result"]
                     else:
-                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                        r = self.compress(
+                            task_content,
+                            context=task_ctx,
+                            bias=task_bias,
+                            precomputed_detection=task_detection,
+                        )
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                    for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                         futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                            executor.submit(
+                                self._timed_compress,
+                                task_content,
+                                task_ctx,
+                                task_bias,
+                                task_detection,
+                            )
                         )
                     task_results = [f.result() for f in futures]
 
@@ -5490,7 +5537,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, task_content, _, _, content_key, enforce_rev), (
+            for (slot_idx, task_content, _, _, content_key, enforce_rev, _), (
                 result,
                 compress_ms,
             ) in zip(pending_tasks, task_results):
