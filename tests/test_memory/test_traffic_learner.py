@@ -1481,6 +1481,59 @@ class TestHydrateEdgeCases:
         assert learner._saved_hashes == set()
         assert learner._persisted_ids == {}
 
+    @pytest.mark.asyncio
+    async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
+        """A persisted history larger than dedup_window must not start the
+        in-memory dedup maps oversized. Hydration keeps at most dedup_window
+        rows (the most-recently-seen), and both maps stay bounded with matching
+        keys — otherwise a long-lived install boots with an unbounded leak that
+        only trims one entry at a time."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        window = 5
+        total = 20
+        conn = _sql.connect(db)
+        try:
+            for i in range(total):
+                conn.execute(
+                    "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        f"id-{i:02d}",
+                        f"Command `cmd{i}` fails; use `alt{i}` instead.",
+                        _json.dumps(
+                            {
+                                "source": "traffic_learner",
+                                "category": "error_recovery",
+                                "evidence_count": 2,
+                                # Higher i == more recently seen; hydration keeps
+                                # the newest `window` of these.
+                                "last_seen_at": f"2026-01-01T00:{i:02d}:00+00:00",
+                            }
+                        ),
+                        "[]",
+                        0.7,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=2, dedup_window=window)
+        await learner._hydrate_persisted_state()
+
+        # Both maps are bounded to the window and hold exactly the same keys.
+        assert len(learner._saved_hashes) <= window
+        assert len(learner._persisted_ids) <= window
+        assert set(learner._persisted_ids) == set(learner._saved_hashes)
+        # The retained rows are the most-recently-seen ones (ids 15..19).
+        assert set(learner._persisted_ids.values()) == {f"id-{i:02d}" for i in range(15, 20)}
+
 
 class TestBumpEdgeCases:
     @pytest.mark.asyncio

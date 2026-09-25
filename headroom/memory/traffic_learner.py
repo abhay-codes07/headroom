@@ -1351,7 +1351,16 @@ class TrafficLearner:
             try:
                 rows = conn.execute(
                     "SELECT id, content, metadata FROM memories "
-                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
+                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner' "
+                    # Hydrate at most dedup_window rows so a large persisted
+                    # history does not start the in-memory dedup maps oversized
+                    # (they are trimmed to dedup_window in steady state). Keep the
+                    # most-recently-seen patterns; rows without last_seen_at
+                    # (legacy) sort last under DESC and are dropped first, with id
+                    # as a deterministic tie-break.
+                    "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC "
+                    "LIMIT ?",
+                    (self._dedup_window,),
                 ).fetchall()
             except sqlite3.DatabaseError:
                 return []
