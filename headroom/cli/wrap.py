@@ -116,6 +116,7 @@ from headroom.providers.copilot import (
 from headroom.providers.copilot import (
     configure_vscode_proxy_settings,
     remove_vscode_proxy_settings,
+    unrouted_vscode_profiles,
     vscode_proxy_url,
     vscode_settings_path,
 )
@@ -439,7 +440,10 @@ _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
 # Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
 _QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
 _QUIET_CLI_FALSY = {"0", "false", "no", "off"}
-# name -> value, injected only when the user has not already set it.
+# name -> value, injected only when the user has not already set it. Every entry
+# here suppresses ONLY zero-signal chatter — telemetry pings, version nags,
+# funding/first-run banners, progress bars, pager framing — never diffs, errors,
+# summaries, or search results.
 _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
     "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
@@ -447,6 +451,20 @@ _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "npm_config_fund": "false",  # drop the funding banner
     "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
     "npm_config_progress": "false",  # drop the install progress bar
+    "npm_config_update_notifier": "false",  # drop the boxed "update available" notice
+    # Cross-tool telemetry opt-out standard (consoledonottrack.com), honored by
+    # turbo, netlify, gatsby, and many others to drop telemetry pings/banners.
+    "DO_NOT_TRACK": "1",
+    # .NET SDK: telemetry ping + the "Welcome to .NET" logo/copyright banner.
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    # JS framework telemetry banners printed on build/dev.
+    "NEXT_TELEMETRY_DISABLED": "1",
+    "GATSBY_TELEMETRY_DISABLED": "1",
+    "ASTRO_TELEMETRY_DISABLED": "1",
+    "NG_CLI_ANALYTICS": "false",  # Angular CLI analytics ping + first-run prompt
+    # Homebrew's "==> ... hints" chatter (not warnings/errors).
+    "HOMEBREW_NO_ENV_HINTS": "1",
 }
 
 
@@ -1066,6 +1084,64 @@ _code_memory_option = click.option(
     help=(
         "Code-memory MCP to register: 'serena' (default) or 'none'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
+    ),
+)
+
+
+# --- Code-memory MCP scope (Claude Code only) --------------------------------
+# Where the code-memory MCP entry is written. Claude Code is the only agent we
+# wrap that has scopes: 'project' keeps the entry in ``projects[<cwd>]`` of
+# ~/.claude.json, 'user' puts it in the machine-wide map. Project is the default
+# because a code-memory server that fails to start at user scope degrades every
+# Claude Code session on the machine, including projects Headroom never touched
+# (#2787). Flows through an env var for the same reason as _code_memory_option.
+_CODE_MEMORY_SCOPE_ENV = "HEADROOM_CODE_MEMORY_SCOPE"
+_CODE_MEMORY_SCOPE_PROJECT = "project"
+_CODE_MEMORY_SCOPE_USER = "user"
+_VALID_CODE_MEMORY_SCOPES = {_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER}
+
+
+def _resolve_code_memory_scope() -> str:
+    """Resolve the requested code-memory scope ('project' by default)."""
+    env = os.environ.get(_CODE_MEMORY_SCOPE_ENV, "").strip().lower()
+    if env:
+        if env not in _VALID_CODE_MEMORY_SCOPES:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_SCOPE_ENV} must be one of: "
+                f"{', '.join(sorted(_VALID_CODE_MEMORY_SCOPES))}"
+            )
+        return env
+    return _CODE_MEMORY_SCOPE_PROJECT
+
+
+def _claude_code_memory_scope() -> str:
+    """Translate the requested scope into Claude Code's own scope name."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    if _resolve_code_memory_scope() == _CODE_MEMORY_SCOPE_USER:
+        return SCOPE_USER
+    return SCOPE_LOCAL
+
+
+def _code_memory_scope_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: mirror ``--code-memory-scope`` into the env var the
+    resolver reads, so no subcommand signature changes."""
+    if value:
+        os.environ[_CODE_MEMORY_SCOPE_ENV] = value
+    return value
+
+
+_code_memory_scope_option = click.option(
+    "--code-memory-scope",
+    type=click.Choice([_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_scope_flag_callback,
+    help=(
+        "Where to register the code-memory MCP: 'project' (default, this "
+        "directory only) or 'user' (every Claude Code session on the machine). "
+        "Also set by HEADROOM_CODE_MEMORY_SCOPE."
     ),
 )
 
@@ -2460,6 +2536,8 @@ def _setup_serena_mcp(
     from headroom.mcp_registry.base import RegisterStatus
     from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
+    ownership_key = getattr(registrar, "ownership_key", lambda name: name)("serena")
+
     if not registrar.detect():
         if verbose:
             click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
@@ -2477,7 +2555,9 @@ def _setup_serena_mcp(
     owned_drift = (
         result.status == RegisterStatus.MISMATCH
         and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+        and headroom_installed_matching(
+            registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+        )
     )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
@@ -2490,8 +2570,15 @@ def _setup_serena_mcp(
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
 
+    # Retire the machine-wide entry once the project-scoped one is in place.
+    # Must run before record_install below: the ledger still holds the
+    # fingerprint of the entry that was installed globally, which is how we
+    # recognise it as ours.
+    if result.ok:
+        _retire_user_scope_serena(registrar)
+
     if result.status == RegisterStatus.REGISTERED:
-        record_install(registrar.name, spec)
+        record_install(registrar.name, spec, ownership_key=ownership_key)
 
     line = format_result(
         registrar.name,
@@ -2509,6 +2596,11 @@ def _setup_serena_mcp(
     )
     if line is not None:
         click.echo(line)
+
+    # Say where it landed, so the scope is discoverable without reading docs.
+    # Only on an actual write (or in verbose): re-wraps should stay quiet.
+    if result.status == RegisterStatus.REGISTERED or verbose:
+        _echo_serena_scope_note(registrar)
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
@@ -2535,9 +2627,89 @@ def _setup_serena_mcp(
     _index_serena_project(verbose=verbose)
 
 
+def _echo_serena_scope_note(registrar: Any) -> None:
+    """Tell the user which sessions the Serena entry will load in."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    scope = getattr(registrar, "scope", None)
+    if scope == SCOPE_LOCAL:
+        click.echo(
+            "    scoped to this project — pass --code-memory-scope user to register it "
+            "for every Claude Code session"
+        )
+    elif scope == SCOPE_USER:
+        click.echo(
+            "    registered for every Claude Code session on this machine "
+            "(--code-memory-scope user)"
+        )
+
+
+def _retire_user_scope_serena(registrar: Any) -> None:
+    """Remove a machine-wide Serena entry left by a pre-#2787 wrap.
+
+    Headroom used to register Serena at Claude Code's user scope, where a
+    Serena that fails to start breaks *every* Claude Code session on the
+    machine — including projects that were never wrapped (#2783). Now that the
+    entry is written per project, the global one is redundant, so an upgrading
+    user gets it cleaned up on their next wrap instead of carrying the blast
+    radius forever.
+
+    Only entries the ledger proves Headroom installed are removed; a Serena the
+    user registered globally themselves is left exactly where it is. No-ops for
+    registrars without scopes (Codex, Grok, OpenCode) and when the user asked
+    for user scope explicitly.
+    """
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    if getattr(registrar, "scope", None) != SCOPE_LOCAL:
+        return
+    try:
+        global_entry = registrar.get_server("serena", scope=SCOPE_USER)
+    except TypeError:  # registrar predates scoped reads
+        return
+    if not headroom_installed_matching(registrar.name, global_entry):
+        return
+    if registrar.unregister_server("serena", scope=SCOPE_USER):
+        # Clear the legacy ledger record along with the config entry it
+        # authorized — otherwise its fingerprint outlives the migration and
+        # can later be mistaken for proof that Headroom owns a same-named
+        # entry the user installs globally themselves.
+        clear_install(registrar.name, "serena")
+        click.echo(
+            "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
+            "(it now loads only in this project)"
+        )
+
+
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    # Claude can own one Serena entry per project plus a legacy user entry.
+    # Examine each relevant scope independently: an unscoped delete would
+    # remove entries whose scope-specific ledger record did not authorize it.
+    if hasattr(registrar, "ownership_key"):
+        from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+        found_owned = False
+        for scope in (SCOPE_LOCAL, SCOPE_USER):
+            current = registrar.get_server("serena", scope=scope)
+            ownership_key = registrar.ownership_key("serena", scope=scope)
+            if current is None:
+                # Nothing left to protect — an ownership record must not
+                # outlive the entry it authorized.
+                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                continue
+            if not headroom_installed_matching(
+                registrar.name, current, ownership_key=ownership_key
+            ):
+                continue
+            found_owned = True
+            if not registrar.unregister_server("serena", scope=scope):
+                return "failed"
+            clear_install(registrar.name, "serena", ownership_key=ownership_key)
+        return "removed" if found_owned else "not_headroom_owned"
 
     current = registrar.get_server("serena")
     if not headroom_installed_matching(registrar.name, current):
@@ -2596,10 +2768,21 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
     """Remove the tokensave MCP entry only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
-    current = registrar.get_server("tokensave")
+    # Headroom only ever installed tokensave machine-wide: it was retired before
+    # #2787 introduced project scope, so its ledger key is the pre-scope (user
+    # scope) one. Pin the ownership check and the delete to that scope — an
+    # unscoped delete now also takes the project entry, which no ledger record
+    # authorizes, and an unscoped read lets a project entry shadow ours.
+    at_user_scope: dict[str, Any] = {}
+    if hasattr(registrar, "ownership_key"):  # Claude; the others have no scopes
+        from headroom.mcp_registry.claude import SCOPE_USER
+
+        at_user_scope = {"scope": SCOPE_USER}
+
+    current = registrar.get_server("tokensave", **at_user_scope)
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
-    if registrar.unregister_server("tokensave"):
+    if registrar.unregister_server("tokensave", **at_user_scope):
         clear_install(registrar.name, "tokensave")
         return "removed"
     return "failed"
@@ -2750,6 +2933,13 @@ def _codex_dotted_key(*parts: str) -> str:
     )
 
 
+_CODEX_EMBEDDED_MODE_NOTE = (
+    "Note: session-scoped routing runs Codex without its shared background server "
+    "(embedded mode). To keep the shared server, route through Codex config instead: "
+    "run `headroom init codex` (or `headroom init -g codex`) once, then start `codex` directly."
+)
+
+
 def _codex_session_launch_settings(
     *, port: int, codex_args: tuple[str, ...], environ: dict[str, str]
 ) -> tuple[tuple[str, ...], dict[str, str], list[str]]:
@@ -2809,6 +2999,11 @@ def _codex_session_launch_settings(
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
+    # Routing is passed as ``--config`` so it stays scoped to this process, and
+    # Codex runs any session with command-line overrides in embedded mode,
+    # without its shared background server (#3888). Say so up front, and point
+    # at the persistent alternative that leaves the shared server in play.
+    display.append(_CODEX_EMBEDDED_MODE_NOTE)
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 
@@ -4199,22 +4394,40 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep wrap recovery gated by both readiness and runtime identity."""
+    from headroom.install.runtime import wait_ready
+
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
+
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
-    from headroom.install.health import probe_ready
-    from headroom.install.models import InstallPreset, SupervisorKind
-    from headroom.install.runtime import start_detached_agent, start_persistent_docker, wait_ready
+    from headroom.install.models import SupervisorKind
+    from headroom.install.runtime import (
+        runtime_ownership,
+        runtime_ready,
+        start_detached_agent,
+        start_persistent_docker,
+    )
     from headroom.install.supervisors import start_supervisor
 
     manifest = _find_persistent_manifest(port)
     if manifest is None:
         return False
 
-    if probe_ready(manifest.health_url):
+    ownership = runtime_ownership(manifest)
+    if runtime_ready(manifest):
         click.echo(f"  Reusing persistent deployment '{manifest.profile}' on port {port}")
         return True
 
-    if manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if ownership == "docker-supervisor":
+        click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
+    elif manifest.supervisor_kind == SupervisorKind.TASK.value:
         click.echo(
             f"  Warning: task-based deployment '{manifest.profile}' cannot be auto-recovered via wrap"
         )
@@ -4222,7 +4435,7 @@ def _recover_persistent_proxy(port: int) -> bool:
 
     click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if ownership == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -4234,7 +4447,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Recovered persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4244,12 +4457,12 @@ def _recover_persistent_proxy(port: int) -> bool:
 
 def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
     """Restart a persistent deployment after an idle stale-version detection."""
-    from headroom.install.models import InstallPreset, SupervisorKind
+    from headroom.install.models import SupervisorKind
     from headroom.install.runtime import (
+        runtime_ownership,
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
-        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4258,7 +4471,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         f"with Headroom {_HEADROOM_VERSION}..."
     )
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             stop_runtime(manifest)
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
@@ -4274,7 +4487,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4446,9 +4659,9 @@ def _ensure_proxy_unlocked(
             )
             manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
-            from headroom.install.health import probe_ready
+            from headroom.install.runtime import runtime_ready
 
-            if probe_ready(manifest.health_url):
+            if runtime_ready(manifest):
                 health_payload = helpers._query_proxy_health(port)
                 running_config = helpers._proxy_health_config(health_payload)
                 if running_config is None:
@@ -4495,8 +4708,11 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                     if helpers._restart_persistent_proxy(manifest, port):
+                        # Restarted from the manifest, whose mode need not be ours.
+                        _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                         return None, port
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4514,6 +4730,7 @@ def _ensure_proxy_unlocked(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to the
                 # non-persistent path which handles proxy restart. A routing
@@ -4559,6 +4776,7 @@ def _ensure_proxy_unlocked(
                                 missing.append("code-graph")
 
                             if not missing:
+                                _warn_proxy_mode_mismatch(running_config)
                                 return None, port
                             flags_str = ", ".join(f"--{f}" for f in missing)
                             click.echo(
@@ -4566,6 +4784,8 @@ def _ensure_proxy_unlocked(
                                 f"is missing: {flags_str}; restarting..."
                             )
                             if helpers._restart_persistent_proxy(manifest, port):
+                                # Restarted from the manifest, whose mode need not be ours.
+                                _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                                 return None, port
                             raise click.ClickException(
                                 f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4665,6 +4885,7 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
 
                 else:
@@ -4743,6 +4964,7 @@ def _ensure_proxy_unlocked(
                                 f"  Please stop the proxy on port {port} manually "
                                 f"and rerun with {flags_str}."
                             )
+                            _warn_proxy_mode_mismatch(running_config)
                             return None, port
 
                 # Routing-level config (backend, upstream URLs) must match in
@@ -4788,6 +5010,7 @@ def _ensure_proxy_unlocked(
             if not needs_restart and reuse_running:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                _warn_proxy_mode_mismatch(running_config)
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -4842,23 +5065,25 @@ def _ensure_proxy_unlocked(
     else:
         if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url:
+        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
-            running_vertex_url = (
-                _normalize_proxy_api_url(running_config.get("vertex_api_url"))
-                if running_config is not None
-                else None
-            )
-            requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-            if running_vertex_url != requested_vertex_url:
-                click.echo(
-                    "  Warning: --no-proxy is set, but the running proxy does not "
-                    "advertise the requested Vertex target. Requests may still go "
-                    "to the proxy's existing Vertex upstream."
+            if vertex_api_url or clear_vertex_api_url:
+                running_vertex_url = (
+                    _normalize_proxy_api_url(running_config.get("vertex_api_url"))
+                    if running_config is not None
+                    else None
                 )
+                requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                if running_vertex_url != requested_vertex_url:
+                    click.echo(
+                        "  Warning: --no-proxy is set, but the running proxy does not "
+                        "advertise the requested Vertex target. Requests may still go "
+                        "to the proxy's existing Vertex upstream."
+                    )
+            _warn_proxy_mode_mismatch(running_config)
         return None, port
 
 
@@ -5448,6 +5673,42 @@ def wrap_selfheal(marker: str | None) -> None:
 # Claude Code
 # =============================================================================
 
+# Hostnames that mean "this machine" — used to avoid feeding the proxy its own
+# URL back as the upstream when the user already had ANTHROPIC_BASE_URL pointed
+# at a previous Headroom instance.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _detect_inbound_anthropic_upstream(port: int) -> str | None:
+    """Return a pre-set ANTHROPIC_BASE_URL that is NOT this proxy, else None.
+
+    Issue #1353: users who already route Claude Code at a LiteLLM (or any
+    custom Anthropic-compatible) gateway via ``ANTHROPIC_BASE_URL`` lose that
+    routing when they run ``headroom wrap claude`` — wrap overwrites
+    ANTHROPIC_BASE_URL with the local proxy URL and silently forwards to
+    api.anthropic.com instead of the LiteLLM URL the user configured. Treat
+    the pre-existing value as the proxy's upstream so compression layers on
+    top of the user's gateway instead of replacing it. URLs pointing at this
+    proxy instance are ignored to avoid a self-referential forwarding loop.
+    """
+
+    base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    if not base_url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _LOCAL_HOSTNAMES:
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            return None
+        if parsed_port == port:
+            return None
+    return base_url
+
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
@@ -5460,6 +5721,7 @@ def wrap_selfheal(marker: str | None) -> None:
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
 @_code_memory_option
+@_code_memory_scope_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
@@ -5559,6 +5821,7 @@ def claude(
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --code-memory none # No code-memory MCP
+        headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
@@ -5672,6 +5935,20 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
+        # Issue #1353: when none of the explicit override channels (Foundry,
+        # Vertex, ANTHROPIC_TARGET_API_URL) apply, inherit a pre-existing
+        # ANTHROPIC_BASE_URL as the upstream so wrap doesn't silently revert
+        # the user's LiteLLM/custom-gateway routing back to api.anthropic.com.
+        custom_upstream: str | None = None
+        if (
+            not foundry_upstream
+            and not use_vertex
+            and not os.environ.get("ANTHROPIC_TARGET_API_URL")
+        ):
+            custom_upstream = _detect_inbound_anthropic_upstream(port)
+
+        upstream_for_proxy = foundry_upstream or custom_upstream
+
         _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
@@ -5682,7 +5959,7 @@ def claude(
             code_graph=code_graph,
             backend=backend,
             region=region,
-            anthropic_api_url=foundry_upstream,
+            anthropic_api_url=upstream_for_proxy,
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
@@ -5700,10 +5977,15 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
+        # Registered per project by default so a Serena that cannot start takes
+        # down this project's sessions only, never every Claude Code session on
+        # the machine (#2787). --code-memory-scope user restores the old
+        # machine-wide registration. The Headroom MCP registrar above keeps user
+        # scope: it is our own server and every wrap exercises it.
         from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
-            ClaudeRegistrar(),
+            ClaudeRegistrar(scope=_claude_code_memory_scope()),
             serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
@@ -5723,6 +6005,8 @@ def claude(
             click.echo(
                 f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={_foundry_proxy_url(proxy_url)} → upstream {foundry_upstream}"
             )
+        elif custom_upstream:
+            click.echo(f"  ANTHROPIC_BASE_URL={proxy_url} → upstream {custom_upstream}")
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
             # Issue #1779: Claude Code 2.1.196+ deterministically disables
@@ -6405,6 +6689,12 @@ def vscode_copilot(
                 vscode_proxy_url(actual_port, _project_name_from_cwd()),
             )
             click.echo(f"  VS Code Copilot proxy settings {action}: {target_settings}")
+            for name, profile_settings in unrouted_vscode_profiles(target_settings.parent):
+                click.echo(
+                    f"  Warning: VS Code profile '{name}' keeps its own settings, so Copilot "
+                    "there still bypasses Headroom. Route it with: headroom wrap vscode "
+                    f'--settings-file "{profile_settings}"'
+                )
             click.echo(
                 "  Keep using Copilot's normal model picker; the selected model is preserved."
             )
@@ -7578,6 +7868,7 @@ def continue_dev(
 
 
 # =============================================================================
+
 # OpenClaw
 # =============================================================================
 
@@ -8571,6 +8862,28 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
+def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy runs a different mode than this session asked for.
+
+    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
+    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
+    other clients may be attached to the running proxy.
+    """
+    requested = os.environ.get("HEADROOM_MODE")
+    running = (running_config or {}).get("mode")
+    if not requested or not isinstance(running, str):
+        return
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
+
+    decision = normalize_proxy_mode_decision(requested, default=running)
+    if not decision.unknown and decision.normalized != running:
+        click.echo(
+            f"  Warning: this session requested {decision.normalized!r} mode but the "
+            f"running proxy is in {running!r} mode (mode is fixed at proxy startup). "
+            "Restart the proxy, or use --port for a separate one."
+        )
+
+
 # =============================================================================
 # Registry-generated wrap commands
 # =============================================================================
@@ -8601,12 +8914,32 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             click.echo(target.install_hint)
             raise SystemExit(1)
 
+        # Exported before proxy startup so _start_proxy forwards it as --mode;
+        # an explicit HEADROOM_MODE always wins.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
+
         env, env_vars_display = _build_registry_launch_env(
             target,
             port,
             os.environ,
             project=_project_name_from_cwd() if target.project_prefix else None,
         )
+
+        configure_launch = None
+        if target.preflight is not None:
+            preflight = target.preflight
+
+            def configure_launch(
+                actual_port: int, args: tuple, env: dict[str, str], display: list[str]
+            ) -> tuple[tuple, dict[str, str], list[str]]:
+                # Runs on the final env: _ensure_proxy may have moved to another
+                # port, and the saved-gateway comparison must use that URL.
+                # Raising here still tears the proxy down via _launch_tool's
+                # cleanup.
+                if problem := preflight(env):
+                    raise click.ClickException(problem)
+                return args, env, display
 
         _launch_tool(
             binary=tool_bin,
@@ -8623,6 +8956,8 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
+            openai_api_url=target.openai_api_url,
+            configure_launch=configure_launch,
         )
 
     _run.__doc__ = target.help_text
