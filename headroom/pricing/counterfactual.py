@@ -55,6 +55,7 @@ beats precise and wrong.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -375,6 +376,24 @@ def _litellm() -> Any | None:
 _RATE_CACHE_MAXSIZE = 256
 
 
+def _canonical_cache_rate(litellm: Any, model: str, field: str, *, long_context: bool) -> float:
+    """Resolve an absent catalog slice through the model's billing calculator.
+
+    LiteLLM versions and model adapters differ: missing rates can contribute
+    zero, list price, or a model-specific discount. Never invent our own ratio.
+    The result is cached with the other resolved rates, not probed per request.
+    """
+    tokens = LONG_CONTEXT_THRESHOLD_TOKENS + 1 if long_context else 1
+    try:
+        input_cost, _ = litellm.cost_per_token(
+            model=model, prompt_tokens=tokens, completion_tokens=0, **{field: tokens}
+        )
+        rate = float(input_cost) / tokens
+    except Exception:
+        return 0.0
+    return rate if math.isfinite(rate) and rate >= 0 else 0.0
+
+
 @lru_cache(maxsize=_RATE_CACHE_MAXSIZE)
 def resolve_rates(
     model: str,
@@ -385,9 +404,9 @@ def resolve_rates(
 ) -> CacheRates | None:
     """Resolve per-bucket input rates for ``model``, or ``None`` if unpriceable.
 
-    ``for_billing`` makes absent cache rates contribute zero, matching LiteLLM's
-    actual cache-slice accounting. Savings estimates use the default fallbacks
-    below instead; those estimates must not manufacture billed cache charges.
+    ``for_billing`` resolves absent cache rates through LiteLLM's model-specific
+    billing calculation. Savings estimates use the default fallbacks below
+    instead; those estimates must not manufacture billed cache charges.
 
     Preference order, strongest first:
 
@@ -421,7 +440,8 @@ def resolve_rates(
     try:
         from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-        info = litellm.model_cost.get(resolve_litellm_model(model), {}) or {}
+        resolved_model = resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved_model, {}) or {}
     except Exception:
         return None
 
@@ -444,9 +464,9 @@ def resolve_rates(
         value = info.get(field)
         return float(value) if value is not None else default
 
-    # Billed cache slices agree with LiteLLM's canonical cost calculation:
-    # an absent catalog rate contributes zero, never an invented input charge.
     # Counterfactual savings retain their existing, labelled estimate fallback.
+    # Billed slices consult the canonical model calculator below when the
+    # catalog omits a rate; missing metadata does not imply free cache.
     missing_cache_rate = 0.0 if for_billing else base
     read = _tier("cache_read_input_token_cost", missing_cache_rate)
     # Savings estimates value otherwise unpriced writes at ordinary input;
@@ -458,6 +478,14 @@ def resolve_rates(
     write_is_catalog = info.get("cache_creation_input_token_cost") is not None or (
         long_context and info.get("cache_creation_input_token_cost_above_200k_tokens") is not None
     )
+    if for_billing and not read_is_catalog:
+        read = _canonical_cache_rate(
+            litellm, resolved_model, "cache_read_input_tokens", long_context=long_context
+        )
+    if for_billing and not write_is_catalog:
+        write_5m = _canonical_cache_rate(
+            litellm, resolved_model, "cache_creation_input_tokens", long_context=long_context
+        )
 
     basis = BASIS_CATALOG
     write_1h_raw = info.get("cache_creation_input_token_cost_above_1hr")

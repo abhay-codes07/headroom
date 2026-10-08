@@ -1,17 +1,10 @@
-"""``_get_cache_prices`` must not bill cache slices it cannot authoritatively price.
+"""Reconcile reported cache slices with model-specific LiteLLM billing.
 
-LiteLLM omits ``cache_read_input_token_cost`` / ``cache_creation_input_token_cost``
-for the long tail of its priced models (most Bedrock, Mistral, Fireworks and
-OpenAI-compatible gateway models). The old ``.get(field, uncached)`` default
-billed those cache reads at the full uncached rate, so ``totals()`` (and the
-/stats figures it feeds) over-charged every cache-warm request on those models.
-
-The fix fails closed: a missing cache field is priced at ``$0`` to reconcile
-with the canonical ``litellm.cost_per_token`` path (which books $0 for a slice
-it cannot price), rather than fabricating a provider-wide discount or premium.
-Bedrock in particular fronts many vendors whose cache economics are not
-interchangeable, so no provider heuristic is applied. Explicit LiteLLM cache
-fields still win.
+Explicit catalog rates win independently. Missing rates use the canonical
+calculator, whose fallback differs across supported versions and models;
+unavailable calculations do not invent Headroom provider-wide prices.
+Counterfactual savings and cache-card provenance remain separate from billing,
+and inferred writes cannot double-charge the uncached input bucket.
 """
 
 from __future__ import annotations
@@ -252,7 +245,81 @@ class TestGetCachePrices:
         tracker.record_tokens(
             model=model, tokens_saved=0, tokens_sent=10_000, cache_read_tokens=10_000
         )
-        assert tracker.totals()[1] == canonical == 0.0
+        assert tracker.totals()[1] == round(canonical, 4)
+
+    @pytest.mark.parametrize("long_context", [False, True])
+    def test_missing_catalog_rates_use_the_model_specific_canonical_calculation(
+        self, monkeypatch, long_context
+    ):
+        resolve_rates.cache_clear()
+        monkeypatch.setattr(
+            "headroom.pricing.litellm_pricing.resolve_litellm_model", lambda model: model
+        )
+        calls = []
+
+        def canonical(**kwargs):
+            calls.append(kwargs)
+            factor = 2 if kwargs["prompt_tokens"] > 200_000 else 1
+            return (
+                factor
+                * (
+                    kwargs.get("cache_read_input_tokens", 0) * 4e-7
+                    + kwargs.get("cache_creation_input_tokens", 0) * 1e-6
+                ),
+                0.0,
+            )
+
+        monkeypatch.setattr(
+            "headroom.pricing.counterfactual._litellm",
+            lambda: SimpleNamespace(
+                model_cost={
+                    "m": {
+                        "input_cost_per_token": 1e-6,
+                        "input_cost_per_token_above_200k_tokens": 2e-6,
+                    }
+                },
+                cost_per_token=canonical,
+            ),
+        )
+        factor = 2 if long_context else 1
+        assert CostTracker()._get_cache_prices("m", long_context=long_context) == (
+            4e-7 * factor,
+            1e-6 * factor,
+            1e-6 * factor,
+            1e-6 * factor,
+        )
+        assert len(calls) == 2
+        assert all(
+            call["model"] == "m" and call["prompt_tokens"] == (200_001 if long_context else 1)
+            for call in calls
+        )
+
+    def test_inferred_writes_are_not_billed_twice_with_canonical_rates(self, monkeypatch):
+        _patch_litellm(
+            monkeypatch,
+            {
+                "m": {
+                    "input_cost_per_token": 1e-6,
+                    "cache_read_input_token_cost": 5e-7,
+                    "cache_creation_input_token_cost": 1e-6,
+                }
+            },
+        )
+        tracker = CostTracker()
+        tracker.record_tokens(
+            model="m",
+            tokens_saved=0,
+            tokens_sent=20_000,
+            cache_read_tokens=10_000,
+            cache_write_tokens=10_000,
+            cache_write_5m_tokens=10_000,
+            uncached_tokens=10_000,
+            cache_inferred=True,
+        )
+        assert tracker.totals()[1] == pytest.approx(0.015)
+        assert tracker.stats()["total_input_cost_usd"] == pytest.approx(0.015)
+        assert tracker._api_cache_write_by_model["m"] == 0
+        assert tracker._api_cache_write_5m_by_model["m"] == 0
 
     def test_explicit_zero_cache_tier_and_one_hour_prices_are_authoritative(self, monkeypatch):
         _patch_litellm(

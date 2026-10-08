@@ -1163,13 +1163,13 @@ class CostTracker:
             self._api_cache_read_by_model.get(model, 0) + cache_read_tokens
         )
         self._api_cache_write_by_model[model] = (
-            self._api_cache_write_by_model.get(model, 0) + cache_write_tokens
+            self._api_cache_write_by_model.get(model, 0) + write_eff
         )
         self._api_cache_write_5m_by_model[model] = (
-            self._api_cache_write_5m_by_model.get(model, 0) + cache_write_5m_tokens
+            self._api_cache_write_5m_by_model.get(model, 0) + write_5m_eff
         )
         self._api_cache_write_1h_by_model[model] = (
-            self._api_cache_write_1h_by_model.get(model, 0) + cache_write_1h_tokens
+            self._api_cache_write_1h_by_model.get(model, 0) + write_1h_eff
         )
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens
@@ -1424,8 +1424,9 @@ class CostTracker:
         persisted tracker, and the durable ledger alike, so the three cannot
         drift apart again.
 
-        ``for_billing`` uses zero for missing cache catalog rates. Savings
-        consumers opt out to keep the resolver's counterfactual estimates.
+        ``for_billing`` resolves missing cache catalog rates through LiteLLM's
+        billing calculator. Savings consumers opt out to keep the resolver's
+        counterfactual estimates.
 
         The 1h write rate is new: LiteLLM publishes it per model as
         ``cache_creation_input_token_cost_above_1hr`` (Sonnet: 2.00x base), and
