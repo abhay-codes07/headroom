@@ -338,6 +338,8 @@ class CacheRates:
     write_1h: float
     uncached: float
     basis: str = BASIS_CATALOG
+    read_is_catalog: bool = True
+    write_is_catalog: bool = True
 
     def price(self, split: TokenSplit) -> float:
         return (
@@ -437,7 +439,7 @@ def resolve_rates(
         """Read ``field``, preferring its above-200k variant on long requests."""
         if long_context:
             hi = info.get(f"{field}_above_200k_tokens")
-            if hi:
+            if hi is not None:
                 return float(hi)
         value = info.get(field)
         return float(value) if value is not None else default
@@ -450,6 +452,12 @@ def resolve_rates(
     # Savings estimates value otherwise unpriced writes at ordinary input;
     # billed provider-reported writes require their own catalog rate.
     write_5m = _tier("cache_creation_input_token_cost", missing_cache_rate)
+    read_is_catalog = info.get("cache_read_input_token_cost") is not None or (
+        long_context and info.get("cache_read_input_token_cost_above_200k_tokens") is not None
+    )
+    write_is_catalog = info.get("cache_creation_input_token_cost") is not None or (
+        long_context and info.get("cache_creation_input_token_cost_above_200k_tokens") is not None
+    )
 
     basis = BASIS_CATALOG
     write_1h_raw = info.get("cache_creation_input_token_cost_above_1hr")
@@ -457,7 +465,7 @@ def resolve_rates(
         # No catalog publishes a combined 1h + above-200k rate, so the long
         # tier always derives. Ratio basis, and labelled as such.
         write_1h_raw = None
-    if write_1h_raw:
+    if write_1h_raw is not None:
         write_1h = float(write_1h_raw)
     elif write_5m > base:
         # Real write premium present but no 1h rate: derive structurally.
@@ -468,7 +476,14 @@ def resolve_rates(
         # price; a 1h write costs what any write costs.
         write_1h = write_5m
 
-    if not for_billing and read == base and write_5m == base and base > 0:
+    if (
+        not for_billing
+        and not read_is_catalog
+        and not write_is_catalog
+        and read == base
+        and write_5m == base
+        and base > 0
+    ):
         # Catalog priced the model but published no cache rates. Fall back to
         # the provider ratio table if we can identify the provider.
         econ = CACHE_ECONOMICS.get((provider or "").split(":")[-1].strip().lower())
@@ -479,9 +494,19 @@ def resolve_rates(
                 write_1h=base * float(econ["write_multiplier"]),
                 uncached=base,
                 basis=BASIS_PROVIDER_RATIO,
+                read_is_catalog=read_is_catalog,
+                write_is_catalog=write_is_catalog,
             )
 
-    return CacheRates(read=read, write_5m=write_5m, write_1h=write_1h, uncached=base, basis=basis)
+    return CacheRates(
+        read=read,
+        write_5m=write_5m,
+        write_1h=write_1h,
+        uncached=base,
+        basis=basis,
+        read_is_catalog=read_is_catalog,
+        write_is_catalog=write_is_catalog,
+    )
 
 
 @dataclass(frozen=True)

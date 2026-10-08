@@ -173,3 +173,121 @@ class TestGetCachePrices:
         _patch_litellm(monkeypatch, {"m": {"input_cost_per_token": 1e-6}})
         assert resolve_rates("m", provider="anthropic").read == 1e-7
         assert CostTracker()._get_cache_prices("m")[0] == 0.0
+
+    def test_missing_write_price_keeps_live_zone_and_tool_savings(self, monkeypatch):
+        _patch_litellm(monkeypatch, {"m": {"input_cost_per_token": 1e-6}})
+        tracker = CostTracker()
+        tracker.record_tokens(
+            model="m",
+            tokens_saved=10_000,
+            tokens_sent=10_000,
+            cache_write_tokens=10_000,
+            tool_schema_saved=5_000,
+        )
+        stats = tracker.stats()
+        assert stats["total_input_cost_usd"] == 0.0
+        assert stats["cache_aware_savings_usd"] == pytest.approx(0.01)
+        assert stats["tool_savings_usd"] == pytest.approx(0.005)
+
+    @pytest.mark.parametrize("cache_read_price", [None, "invalid"])
+    def test_unknown_read_rate_is_not_advertised_as_catalog_free_cache(
+        self, monkeypatch, cache_read_price
+    ):
+        from headroom.proxy.cost import build_prefix_cache_stats
+        from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+        _patch_litellm(
+            monkeypatch,
+            {
+                "gpt-unknown": {
+                    "input_cost_per_token": 1e-6,
+                    "cache_read_input_token_cost": cache_read_price,
+                }
+            },
+        )
+        tracker = CostTracker()
+        tracker._tokens_sent_by_model["gpt-unknown"] = 1_000_000
+        monkeypatch.setattr(tracker, "_get_list_price", lambda model: 1.0)
+        metrics = PrometheusMetrics()
+        metrics.cache_by_provider["openai"].update(
+            {
+                "requests": 1,
+                "hit_requests": 1,
+                "cache_read_tokens": 1_000_000,
+            }
+        )
+        row = build_prefix_cache_stats(metrics, tracker)["by_provider"]["openai"]
+        assert row["cache_pricing_source"] == "provider_default"
+        assert row["savings_usd"] == pytest.approx(0.5)
+
+    def test_canonical_litellm_cache_only_cost_matches_dashboard(self, monkeypatch):
+        import litellm
+
+        from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+        # Keep the actual canonical calculator, with a deterministic catalog
+        # row: the shared test suite enriches real model rows with cache rates.
+        model = "openai/headroom-missing-cache-rate-regression"
+        monkeypatch.setitem(
+            litellm.model_cost,
+            model,
+            {
+                "input_cost_per_token": 5e-7,
+                "output_cost_per_token": 1e-6,
+                "litellm_provider": "openai",
+                "mode": "chat",
+            },
+        )
+        resolved = resolve_litellm_model(model)
+        info = litellm.model_cost[resolved]
+        assert info.get("cache_read_input_token_cost") is None
+        assert info.get("cache_creation_input_token_cost") is None
+        canonical, _ = litellm.cost_per_token(
+            model=resolved,
+            prompt_tokens=10_000,
+            completion_tokens=0,
+            cache_read_input_tokens=10_000,
+        )
+        tracker = CostTracker()
+        tracker.record_tokens(
+            model=model, tokens_saved=0, tokens_sent=10_000, cache_read_tokens=10_000
+        )
+        assert tracker.totals()[1] == canonical == 0.0
+
+    def test_explicit_zero_cache_tier_and_one_hour_prices_are_authoritative(self, monkeypatch):
+        _patch_litellm(
+            monkeypatch,
+            {
+                "m": {
+                    "input_cost_per_token": 1e-6,
+                    "input_cost_per_token_above_200k_tokens": 2e-6,
+                    "cache_read_input_token_cost": 1e-7,
+                    "cache_read_input_token_cost_above_200k_tokens": 0.0,
+                    "cache_creation_input_token_cost": 1.25e-6,
+                    "cache_creation_input_token_cost_above_200k_tokens": 0.0,
+                    "cache_creation_input_token_cost_above_1hr": 0.0,
+                }
+            },
+        )
+        assert CostTracker()._get_cache_prices("m")[2] == 0.0
+        assert CostTracker()._get_cache_prices("m", long_context=True) == (
+            0.0,
+            0.0,
+            0.0,
+            2e-6,
+        )
+
+    def test_explicit_list_rate_cache_prices_do_not_inherit_provider_discounts(self, monkeypatch):
+        _patch_litellm(
+            monkeypatch,
+            {
+                "m": {
+                    "input_cost_per_token": 1e-6,
+                    "cache_read_input_token_cost": 1e-6,
+                    "cache_creation_input_token_cost": 1e-6,
+                }
+            },
+        )
+        rates = resolve_rates("m", provider="anthropic")
+        assert rates.read == rates.write_5m == 1e-6
+        assert rates.read_is_catalog and rates.write_is_catalog
