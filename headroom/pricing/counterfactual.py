@@ -379,8 +379,13 @@ def resolve_rates(
     *,
     long_context: bool = False,
     provider: str | None = None,
+    for_billing: bool = False,
 ) -> CacheRates | None:
     """Resolve per-bucket input rates for ``model``, or ``None`` if unpriceable.
+
+    ``for_billing`` makes absent cache rates contribute zero, matching LiteLLM's
+    actual cache-slice accounting. Savings estimates use the default fallbacks
+    below instead; those estimates must not manufacture billed cache charges.
 
     Preference order, strongest first:
 
@@ -437,11 +442,14 @@ def resolve_rates(
         value = info.get(field)
         return float(value) if value is not None else default
 
-    read = _tier("cache_read_input_token_cost", base)
-    # A provider that does not bill cache writes leaves this absent; writes then
-    # cost the same as ordinary input, which is exactly OpenAI's and Gemini's
-    # actual behaviour.
-    write_5m = _tier("cache_creation_input_token_cost", base)
+    # Billed cache slices agree with LiteLLM's canonical cost calculation:
+    # an absent catalog rate contributes zero, never an invented input charge.
+    # Counterfactual savings retain their existing, labelled estimate fallback.
+    missing_cache_rate = 0.0 if for_billing else base
+    read = _tier("cache_read_input_token_cost", missing_cache_rate)
+    # Savings estimates value otherwise unpriced writes at ordinary input;
+    # billed provider-reported writes require their own catalog rate.
+    write_5m = _tier("cache_creation_input_token_cost", missing_cache_rate)
 
     basis = BASIS_CATALOG
     write_1h_raw = info.get("cache_creation_input_token_cost_above_1hr")
@@ -460,7 +468,7 @@ def resolve_rates(
         # price; a 1h write costs what any write costs.
         write_1h = write_5m
 
-    if read == base and write_5m == base and base > 0:
+    if not for_billing and read == base and write_5m == base and base > 0:
         # Catalog priced the model but published no cache rates. Fall back to
         # the provider ratio table if we can identify the provider.
         econ = CACHE_ECONOMICS.get((provider or "").split(":")[-1].strip().lower())

@@ -20,12 +20,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.pricing.counterfactual import resolve_rates
 from headroom.proxy.cost import CostTracker
 
 
+@pytest.fixture(autouse=True)
+def clear_rate_cache():
+    resolve_rates.cache_clear()
+    yield
+    resolve_rates.cache_clear()
+
+
 def _patch_litellm(monkeypatch: pytest.MonkeyPatch, model_cost: dict) -> None:
+    resolve_rates.cache_clear()
     monkeypatch.setattr(
-        "headroom.proxy.cost._get_litellm_module",
+        "headroom.pricing.counterfactual._litellm",
         lambda: SimpleNamespace(model_cost=model_cost),
     )
     monkeypatch.setattr(
@@ -49,7 +58,7 @@ class TestGetCachePrices:
                 }
             },
         )
-        assert CostTracker()._get_cache_prices("m") == (1e-7, 1.25e-6, 1e-6)
+        assert CostTracker()._get_cache_prices("m") == (1e-7, 1.25e-6, 2e-6, 1e-6)
 
     def test_missing_cache_fields_priced_at_zero_not_full_rate(
         self, monkeypatch: pytest.MonkeyPatch
@@ -62,7 +71,7 @@ class TestGetCachePrices:
             monkeypatch,
             {"m": {"input_cost_per_token": 5e-7, "litellm_provider": "mistral"}},
         )
-        assert CostTracker()._get_cache_prices("m") == (0.0, 0.0, 5e-7)
+        assert CostTracker()._get_cache_prices("m") == (0.0, 0.0, 0.0, 5e-7)
 
     def test_only_the_missing_field_is_zeroed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Explicit read cost present, write cost absent: keep the real read,
@@ -77,7 +86,7 @@ class TestGetCachePrices:
                 }
             },
         )
-        assert CostTracker()._get_cache_prices("m") == (3e-7, 0.0, 1e-6)
+        assert CostTracker()._get_cache_prices("m") == (3e-7, 0.0, 0.0, 1e-6)
 
     def test_no_input_price_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_litellm(monkeypatch, {"m": {"litellm_provider": "anthropic"}})
@@ -99,10 +108,11 @@ class TestGetCachePrices:
         if litellm_provider is not None:
             info["litellm_provider"] = litellm_provider
         _patch_litellm(monkeypatch, {"m": info})
-        cache_read, cache_write, got_uncached = CostTracker()._get_cache_prices("m")
+        cache_read, cache_write, cache_write_1h, got_uncached = CostTracker()._get_cache_prices("m")
         assert got_uncached == uncached
         assert cache_read == 0.0
         assert cache_write == 0.0
+        assert cache_write_1h == 0.0
         # Explicitly not the Anthropic multipliers the old fallback would apply.
         assert cache_read != pytest.approx(uncached * 0.1)
         assert cache_write != pytest.approx(uncached * 1.25)
@@ -118,8 +128,48 @@ class TestGetCachePrices:
             monkeypatch,
             {"m": {"input_cost_per_token": 5e-7, "litellm_provider": "fireworks_ai"}},
         )
-        cr_price, cw_price, uncached_price = CostTracker()._get_cache_prices("m")
+        cr_price, cw_price, _, uncached_price = CostTracker()._get_cache_prices("m")
         cr_tokens, cw_tokens = 20_000, 5_000
         # Cache-slice cost contributed to totals() is exactly $0, matching canonical.
         assert cr_tokens * cr_price + cw_tokens * cw_price == 0.0
         assert uncached_price == 5e-7
+
+    def test_totals_and_stats_charge_only_known_slices(self, monkeypatch):
+        _patch_litellm(monkeypatch, {"m": {"input_cost_per_token": 5e-7}})
+        tracker = CostTracker()
+        tracker.record_tokens(
+            model="m",
+            tokens_saved=0,
+            tokens_sent=26_000,
+            cache_read_tokens=20_000,
+            cache_write_tokens=5_000,
+            uncached_tokens=1_000,
+        )
+        assert tracker.totals() == (26_000, 0.0005)
+        assert tracker.stats()["total_input_cost_usd"] == 0.0005
+
+    def test_missing_read_preserves_explicit_write_and_ttl_tier(self, monkeypatch):
+        _patch_litellm(
+            monkeypatch,
+            {
+                "m": {
+                    "input_cost_per_token": 1e-6,
+                    "input_cost_per_token_above_200k_tokens": 2e-6,
+                    "cache_creation_input_token_cost": 1.25e-6,
+                    "cache_creation_input_token_cost_above_200k_tokens": 2.5e-6,
+                    "cache_creation_input_token_cost_above_1hr": 2e-6,
+                }
+            },
+        )
+        assert CostTracker()._get_cache_prices("m") == (0.0, 1.25e-6, 2e-6, 1e-6)
+        assert CostTracker()._get_cache_prices("m", long_context=True) == (
+            0.0,
+            2.5e-6,
+            4e-6,
+            2e-6,
+        )
+
+    def test_savings_provider_ratio_remains_separate_from_billed_prices(self, monkeypatch):
+        _patch_litellm(monkeypatch, {"m": {"input_cost_per_token": 1e-6}})
+        assert resolve_rates("m", provider="anthropic").read == 1e-7
+        assert CostTracker()._get_cache_prices("m")[0] == 0.0
